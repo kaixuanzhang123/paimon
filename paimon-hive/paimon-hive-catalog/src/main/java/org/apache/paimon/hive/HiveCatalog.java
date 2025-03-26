@@ -974,10 +974,7 @@ public class HiveCatalog extends AbstractCatalog {
                     }
                 } catch (Exception ee) {
                     LOG.error("Delete directory[{}] fail for table {}", path, identifier, ee);
-                    throw new RuntimeException(
-                            String.format(
-                                    "Delete directory[%s] fail for table %s",
-                                    path, identifier), ee);
+                    throw new RuntimeException("Delete directory fail for table " + identifier.getFullName(), ee);
                 }
             }
 
