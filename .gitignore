@@ -19,6 +19,10 @@ target
 .java-version
 dependency-reduced-pom.xml
 metastore_db/
+paimon-python/.idea/
+paimon-python/dist/
+paimon-python/*.egg-info/
+paimon-python/dev/log
 
 ### VS Code ###
 .vscode/

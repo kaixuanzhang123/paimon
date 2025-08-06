@@ -29,6 +29,7 @@ import org.apache.paimon.memory.MemorySegmentPool;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.SinkRecord;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CommitIncrement;
 import org.apache.paimon.utils.RecordWriter;
 import org.apache.paimon.utils.Restorable;
@@ -51,6 +52,11 @@ public interface FileStoreWrite<T> extends Restorable<List<FileStoreWrite.State<
     FileStoreWrite<T> withWriteRestore(WriteRestore writeRestore);
 
     FileStoreWrite<T> withIOManager(IOManager ioManager);
+
+    /** Specified the write rowType. */
+    default void withWriteType(RowType writeType) {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * With memory pool for the current file store write.
@@ -80,13 +86,6 @@ public interface FileStoreWrite<T> extends Restorable<List<FileStoreWrite.State<
      * table option.
      */
     void withIgnoreNumBucketCheck(boolean ignoreNumBucketCheck);
-
-    /**
-     * We detect whether it is in batch mode, if so, we do some optimization.
-     *
-     * @param isStreamingMode whether in streaming mode
-     */
-    void withExecutionMode(boolean isStreamingMode);
 
     /** With metrics to measure compaction. */
     FileStoreWrite<T> withMetricRegistry(MetricRegistry metricRegistry);

@@ -18,6 +18,7 @@
 
 package org.apache.paimon.rest;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.PagedList;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.annotation.VisibleForTesting;
@@ -428,6 +429,7 @@ public class RESTCatalog implements Catalog {
             checkNotBranch(identifier, "createTable");
             checkNotSystemTable(identifier, "createTable");
             validateCreateTable(schema);
+            createExternalTablePathIfNotExist(schema);
             api.createTable(identifier, schema);
         } catch (AlreadyExistsException e) {
             if (!ignoreIfExists) {
@@ -529,6 +531,22 @@ public class RESTCatalog implements Catalog {
             }
         } catch (ForbiddenException e) {
             throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void registerTable(Identifier identifier, String path)
+            throws TableAlreadyExistException {
+        try {
+            api.registerTable(identifier, path);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (AlreadyExistsException e) {
+            throw new TableAlreadyExistException(identifier);
+        } catch (ServiceFailureException e) {
+            throw new IllegalStateException(e.getMessage());
+        } catch (BadRequestException e) {
+            throw new RuntimeException(new IllegalArgumentException(e.getMessage()));
         }
     }
 
@@ -953,7 +971,7 @@ public class RESTCatalog implements Catalog {
 
     private FileIO fileIOForData(Path path, Identifier identifier) {
         return dataTokenEnabled
-                ? new RESTTokenFileIO(catalogLoader(), this, identifier, path)
+                ? new RESTTokenFileIO(context, api, identifier, path)
                 : fileIOFromOptions(path);
     }
 
@@ -962,6 +980,18 @@ public class RESTCatalog implements Catalog {
             return FileIO.get(path, context);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    private void createExternalTablePathIfNotExist(Schema schema) throws IOException {
+        Map<String, String> options = schema.options();
+        if (options.containsKey(CoreOptions.PATH.key())) {
+            Path path = new Path(options.get(PATH.key()));
+            try (FileIO fileIO = fileIOFromOptions(path)) {
+                if (!fileIO.exists(path)) {
+                    fileIO.mkdirs(path);
+                }
+            }
         }
     }
 }

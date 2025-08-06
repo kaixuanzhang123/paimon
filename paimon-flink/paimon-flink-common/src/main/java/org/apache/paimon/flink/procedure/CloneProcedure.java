@@ -19,13 +19,16 @@
 package org.apache.paimon.flink.procedure;
 
 import org.apache.paimon.flink.action.CloneAction;
+import org.apache.paimon.utils.StringUtils;
 
 import org.apache.flink.table.annotation.ArgumentHint;
 import org.apache.flink.table.annotation.DataTypeHint;
 import org.apache.flink.table.annotation.ProcedureHint;
 import org.apache.flink.table.procedure.ProcedureContext;
 
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /** Clone tables procedure. */
@@ -54,7 +57,19 @@ public class CloneProcedure extends ProcedureBase {
                         type = @DataTypeHint("STRING"),
                         isOptional = true),
                 @ArgumentHint(name = "parallelism", type = @DataTypeHint("INT"), isOptional = true),
-                @ArgumentHint(name = "where", type = @DataTypeHint("STRING"), isOptional = true)
+                @ArgumentHint(name = "where", type = @DataTypeHint("STRING"), isOptional = true),
+                @ArgumentHint(
+                        name = "included_tables",
+                        type = @DataTypeHint("STRING"),
+                        isOptional = true),
+                @ArgumentHint(
+                        name = "excluded_tables",
+                        type = @DataTypeHint("STRING"),
+                        isOptional = true),
+                @ArgumentHint(
+                        name = "clone_from",
+                        type = @DataTypeHint("STRING"),
+                        isOptional = true)
             })
     public String[] call(
             ProcedureContext procedureContext,
@@ -65,13 +80,25 @@ public class CloneProcedure extends ProcedureBase {
             String targetTableName,
             String targetCatalogConfigStr,
             Integer parallelism,
-            String where)
+            String where,
+            String includedTablesStr,
+            String excludedTablesStr,
+            String cloneFrom)
             throws Exception {
         Map<String, String> sourceCatalogConfig =
                 new HashMap<>(optionalConfigMap(sourceCatalogConfigStr));
 
         Map<String, String> targetCatalogConfig =
                 new HashMap<>(optionalConfigMap(targetCatalogConfigStr));
+
+        List<String> includedTables =
+                StringUtils.isNullOrWhitespaceOnly(includedTablesStr)
+                        ? null
+                        : Arrays.asList(StringUtils.split(includedTablesStr, ","));
+        List<String> excludedTables =
+                StringUtils.isNullOrWhitespaceOnly(excludedTablesStr)
+                        ? null
+                        : Arrays.asList(StringUtils.split(excludedTablesStr, ","));
 
         CloneAction action =
                 new CloneAction(
@@ -82,7 +109,10 @@ public class CloneProcedure extends ProcedureBase {
                         targetTableName,
                         targetCatalogConfig,
                         parallelism,
-                        where);
+                        where,
+                        includedTables,
+                        excludedTables,
+                        cloneFrom);
         return execute(procedureContext, action, "Clone Job");
     }
 

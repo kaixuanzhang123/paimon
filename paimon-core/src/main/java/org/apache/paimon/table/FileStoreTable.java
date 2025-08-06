@@ -32,6 +32,7 @@ import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.TableWriteImpl;
+import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.BranchManager;
 import org.apache.paimon.utils.ChangelogManager;
@@ -132,6 +133,8 @@ public interface FileStoreTable extends DataTable {
      */
     @Override
     FileStoreTable switchToBranch(String branchName);
+
+    TagAutoManager newTagAutoManager();
 
     /** Purge all files in this table. */
     default void purgeFiles() throws Exception {

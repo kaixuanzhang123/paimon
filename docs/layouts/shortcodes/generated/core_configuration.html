@@ -57,6 +57,12 @@ under the License.
             <td>Bucket number for file store.<br />It should either be equal to -1 (dynamic bucket mode), -2 (postpone bucket mode), or it must be greater than 0 (fixed bucket mode).</td>
         </tr>
         <tr>
+            <td><h5>bucket-append-ordered</h5></td>
+            <td style="word-wrap: break-word;">true</td>
+            <td>Boolean</td>
+            <td>Whether to ignore the order of the buckets when reading data from an append-only table.</td>
+        </tr>
+        <tr>
             <td><h5>bucket-function.type</h5></td>
             <td style="word-wrap: break-word;">default</td>
             <td><p>Enum</p></td>
@@ -135,6 +141,18 @@ under the License.
             <td>The maximum time of completed changelog to retain.</td>
         </tr>
         <tr>
+            <td><h5>clustering.columns</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>String</td>
+            <td>Specifies the column name(s) used for comparison during range partitioning, in the format 'columnName1,columnName2'. If not set or set to an empty string, it indicates that the range partitioning feature is not enabled. This option will be effective only for append table without primary keys and batch execution mode.</td>
+        </tr>
+        <tr>
+            <td><h5>clustering.strategy</h5></td>
+            <td style="word-wrap: break-word;">"auto"</td>
+            <td>String</td>
+            <td>Specifies the comparison algorithm used for range partitioning, including 'zorder', 'hilbert', and 'order', corresponding to the z-order curve algorithm, hilbert curve algorithm, and basic type comparison algorithm, respectively. When not configured, it will automatically determine the algorithm based on the number of columns in 'sink.clustering.by-columns'. 'order' is used for 1 column, 'zorder' for less than 5 columns, and 'hilbert' for 5 or more columns.</td>
+        </tr>
+        <tr>
             <td><h5>commit.callback.#.param</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>String</td>
@@ -163,6 +181,18 @@ under the License.
             <td style="word-wrap: break-word;">10</td>
             <td>Integer</td>
             <td>Maximum number of retries when commit failed.</td>
+        </tr>
+        <tr>
+            <td><h5>commit.max-retry-wait</h5></td>
+            <td style="word-wrap: break-word;">10 s</td>
+            <td>Duration</td>
+            <td>Max retry wait time when commit failed.</td>
+        </tr>
+        <tr>
+            <td><h5>commit.min-retry-wait</h5></td>
+            <td style="word-wrap: break-word;">10 ms</td>
+            <td>Duration</td>
+            <td>Min retry wait time when commit failed.</td>
         </tr>
         <tr>
             <td><h5>commit.strict-mode.last-safe-snapshot</h5></td>
@@ -213,6 +243,24 @@ under the License.
             <td>For file set [f_0,...,f_N], the minimum file number to trigger a compaction for append-only table.</td>
         </tr>
         <tr>
+            <td><h5>compaction.offpeak-ratio</h5></td>
+            <td style="word-wrap: break-word;">0</td>
+            <td>Integer</td>
+            <td>Allows you to set a different (by default, more aggressive) percentage ratio for determining  whether larger sorted run's size are included in compactions during off-peak hours. Works in the  same way as compaction.size-ratio. Only applies if offpeak.start.hour and  offpeak.end.hour are also enabled. <br /> For instance, if your cluster experiences low pressure between 2 AM  and 6 PM ,  you can configure `compaction.offpeak.start.hour=2` and `compaction.offpeak.end.hour=18` to define this period as off-peak hours.  During these hours, you can increase the off-peak compaction ratio (e.g. `compaction.offpeak-ratio=20`) to enable more aggressive data compaction</td>
+        </tr>
+        <tr>
+            <td><h5>compaction.offpeak.end.hour</h5></td>
+            <td style="word-wrap: break-word;">-1</td>
+            <td>Integer</td>
+            <td>The end of off-peak hours, expressed as an integer between 0 and 23, inclusive. Set to -1 to disable off-peak.</td>
+        </tr>
+        <tr>
+            <td><h5>compaction.offpeak.start.hour</h5></td>
+            <td style="word-wrap: break-word;">-1</td>
+            <td>Integer</td>
+            <td>The start of off-peak hours, expressed as an integer between 0 and 23, inclusive Set to -1 to disable off-peak</td>
+        </tr>
+        <tr>
             <td><h5>compaction.optimization-interval</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>Duration</td>
@@ -223,6 +271,12 @@ under the License.
             <td style="word-wrap: break-word;">1</td>
             <td>Integer</td>
             <td>Percentage flexibility while comparing sorted run size for changelog mode table. If the candidate sorted run(s) size is 1% smaller than the next sorted run's size, then include next sorted run into this candidate set.</td>
+        </tr>
+        <tr>
+            <td><h5>compaction.total-size-threshold</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>MemorySize</td>
+            <td>When total size is smaller than this threshold, force a full compaction.</td>
         </tr>
         <tr>
             <td><h5>consumer-id</h5></td>
@@ -828,6 +882,12 @@ This config option does not affect the default filesystem metastore.</td>
             <td>Time field for record level expire. It supports the following types: `timestamps in seconds with INT`,`timestamps in seconds with BIGINT`, `timestamps in milliseconds with BIGINT` or `timestamp`.</td>
         </tr>
         <tr>
+            <td><h5>row-tracking.enabled</h5></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Whether enable unique row id for append table.</td>
+        </tr>
+        <tr>
             <td><h5>rowkind.field</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>String</td>
@@ -924,6 +984,12 @@ This config option does not affect the default filesystem metastore.</td>
             <td>Specify the order of sequence.field.<br /><br />Possible values:<ul><li>"ascending": specifies sequence.field sort order is ascending.</li><li>"descending": specifies sequence.field sort order is descending.</li></ul></td>
         </tr>
         <tr>
+            <td><h5>sink.process-time-zone</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>String</td>
+            <td>The time zone to parse the long process time to TIMESTAMP value. The default value is JVM's default time zone. If you want to specify a time zone, you should either set a full name such as 'America/Los_Angeles' or a custom zone id such as 'GMT-08:00'. This option currently is used for extract tag name.</td>
+        </tr>
+        <tr>
             <td><h5>sink.watermark-time-zone</h5></td>
             <td style="word-wrap: break-word;">"UTC"</td>
             <td>String</td>
@@ -946,6 +1012,12 @@ This config option does not affect the default filesystem metastore.</td>
             <td style="word-wrap: break-word;">50</td>
             <td>Integer</td>
             <td>The maximum number of snapshots allowed to expire at a time.</td>
+        </tr>
+        <tr>
+            <td><h5>snapshot.ignore-empty-commit</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>Boolean</td>
+            <td>Whether ignore empty commit.</td>
         </tr>
         <tr>
             <td><h5>snapshot.num-retained.max</h5></td>
@@ -1132,7 +1204,13 @@ If the data size allocated for the sorting task is uneven,which may lead to perf
             <td><h5>type</h5></td>
             <td style="word-wrap: break-word;">table</td>
             <td><p>Enum</p></td>
-            <td>Type of the table.<br /><br />Possible values:<ul><li>"table": Normal Paimon table.</li><li>"format-table": A file format table refers to a directory that contains multiple files of the same format.</li><li>"materialized-table": A materialized table combines normal Paimon table and materialized SQL.</li><li>"object-table": An object table combines normal Paimon table and object location.</li></ul></td>
+            <td>Type of the table.<br /><br />Possible values:<ul><li>"table": Normal Paimon table.</li><li>"format-table": A file format table refers to a directory that contains multiple files of the same format.</li><li>"materialized-table": A materialized table combines normal Paimon table and materialized SQL.</li><li>"object-table": An object table combines normal Paimon table and object location.</li><li>"lance-table": A lance table, see 'https://lancedb.github.io/lance/'.</li><li>"iceberg-table": An iceberg table, see 'https://iceberg.apache.org/'.</li></ul></td>
+        </tr>
+        <tr>
+            <td><h5>upsert-key</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>String</td>
+            <td>Define upsert key to do MERGE INTO when executing INSERT INTO, cannot be defined with primary key.</td>
         </tr>
         <tr>
             <td><h5>write-buffer-for-append</h5></td>
@@ -1154,9 +1232,9 @@ If the data size allocated for the sorting task is uneven,which may lead to perf
         </tr>
         <tr>
             <td><h5>write-buffer-spillable</h5></td>
-            <td style="word-wrap: break-word;">(none)</td>
+            <td style="word-wrap: break-word;">true</td>
             <td>Boolean</td>
-            <td>Whether the write buffer can be spillable. Enabled by default when using object storage or when 'target-file-size' is greater than 'write-buffer-size'.</td>
+            <td>Whether the write buffer can be spillable.</td>
         </tr>
         <tr>
             <td><h5>write-max-writers-to-spill</h5></td>
@@ -1169,6 +1247,12 @@ If the data size allocated for the sorting task is uneven,which may lead to perf
             <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>
             <td>If set to true, compactions and snapshot expiration will be skipped. This option is used along with dedicated compact jobs.</td>
+        </tr>
+        <tr>
+            <td><h5>write.batch-memory</h5></td>
+            <td style="word-wrap: break-word;">128 mb</td>
+            <td>MemorySize</td>
+            <td>Write batch memory for any file format if it supports.</td>
         </tr>
         <tr>
             <td><h5>write.batch-size</h5></td>

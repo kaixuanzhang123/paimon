@@ -25,6 +25,7 @@ import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.utils.SnapshotManager;
 
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -35,11 +36,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -122,6 +126,18 @@ public class SparkWriteITCase {
         assertThat(rows.toString())
                 .isEqualTo(
                         "[[1,2,my_value], [2,2,my_value], [3,2,my_value], [4,2,my_value], [5,3,my_value]]");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"order", "zorder", "hilbert"})
+    public void testWriteWithClustering(String clusterStrategy) {
+        spark.sql(
+                "CREATE TABLE T (a INT, b INT) TBLPROPERTIES ("
+                        + "'clustering.columns'='a,b',"
+                        + String.format("'clustering.strategy'='%s')", clusterStrategy));
+        spark.sql("INSERT INTO T VALUES (2, 2), (1, 1), (3, 3)").collectAsList();
+        List<Row> rows = spark.sql("SELECT * FROM T").collectAsList();
+        assertThat(rows.toString()).isEqualTo("[[1,1], [2,2], [3,3]]");
     }
 
     @Test
@@ -295,7 +311,7 @@ public class SparkWriteITCase {
                 rows.stream().map(x -> x.getString(0)).collect(Collectors.toList());
         Assertions.assertEquals(3, fileNames.size());
         for (String fileName : fileNames) {
-            Assertions.assertTrue(fileName.startsWith("data-"));
+            Assertions.assertTrue(fileName.contains("data-"));
         }
     }
 
@@ -316,7 +332,7 @@ public class SparkWriteITCase {
                 rows.stream().map(x -> x.getString(0)).collect(Collectors.toList());
         Assertions.assertEquals(3, fileNames.size());
         for (String fileName : fileNames) {
-            Assertions.assertTrue(fileName.startsWith("test-"));
+            Assertions.assertTrue(fileName.contains("test-"));
         }
     }
 
@@ -337,7 +353,7 @@ public class SparkWriteITCase {
                 rows.stream().map(x -> x.getString(0)).collect(Collectors.toList());
         Assertions.assertEquals(3, fileNames.size());
         for (String fileName : fileNames) {
-            Assertions.assertTrue(fileName.startsWith("test-"));
+            Assertions.assertTrue(fileName.contains("test-"));
         }
 
         // reset config, it will affect other tests
@@ -453,7 +469,7 @@ public class SparkWriteITCase {
         List<String> files =
                 Arrays.stream(fileIO.listStatus(new Path(tabLocation, "bucket-0")))
                         .map(name -> name.getPath().getName())
-                        .filter(name -> name.startsWith("changelog-"))
+                        .filter(name -> name.contains("changelog-"))
                         .collect(Collectors.toList());
         String defaultExtension = "." + "parquet";
         String newExtension = "." + "zstd" + "." + "parquet";
@@ -473,6 +489,42 @@ public class SparkWriteITCase {
         spark.conf().unset("spark.paimon.file.suffix.include.compression");
     }
 
+    @Test
+    public void testIgnoreEmptyCommitConfigurable() {
+        spark.sql(
+                "CREATE TABLE T (id INT, name STRING) "
+                        + "TBLPROPERTIES ("
+                        + "'bucket-key'='id', "
+                        + "'bucket' = '1', "
+                        + "'file.format' = 'avro')");
+
+        FileStoreTable table = getTable("T");
+        SnapshotManager snapshotManager = table.snapshotManager();
+
+        spark.sql("insert into T values (1, 'aa')");
+        Assertions.assertEquals(1, snapshotManager.latestSnapshotId());
+
+        spark.sql("delete from T where id = 1");
+        Assertions.assertEquals(2, snapshotManager.latestSnapshotId());
+        Assertions.assertEquals(
+                -1, Objects.requireNonNull(snapshotManager.latestSnapshot()).deltaRecordCount());
+
+        // in batch write, ignore.empty.commit default is true
+        spark.sql("delete from T where id = 1");
+        Assertions.assertEquals(2, snapshotManager.latestSnapshotId());
+        Assertions.assertEquals(
+                -1, Objects.requireNonNull(snapshotManager.latestSnapshot()).deltaRecordCount());
+
+        // set false to allow commit empty snapshot
+        spark.conf().set("spark.paimon.snapshot.ignore-empty-commit", "false");
+        spark.sql("delete from T where id = 1");
+        Assertions.assertEquals(3, snapshotManager.latestSnapshotId());
+        Assertions.assertEquals(
+                0, Objects.requireNonNull(snapshotManager.latestSnapshot()).deltaRecordCount());
+
+        spark.conf().unset("spark.paimon.snapshot.ignore-empty-commit");
+    }
+
     protected static FileStoreTable getTable(String tableName) {
         return FileStoreTableFactory.create(
                 LocalFileIO.create(),
@@ -480,8 +532,6 @@ public class SparkWriteITCase {
     }
 
     private long dataFileCount(FileStatus[] files, String filePrefix) {
-        return Arrays.stream(files)
-                .filter(f -> f.getPath().getName().startsWith(filePrefix))
-                .count();
+        return Arrays.stream(files).filter(f -> f.getPath().getName().contains(filePrefix)).count();
     }
 }

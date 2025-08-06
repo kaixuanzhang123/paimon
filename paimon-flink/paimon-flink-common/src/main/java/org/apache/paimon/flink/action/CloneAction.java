@@ -20,23 +20,13 @@ package org.apache.paimon.flink.action;
 
 import org.apache.paimon.catalog.CachingCatalog;
 import org.apache.paimon.catalog.Catalog;
-import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.flink.clone.CloneFileInfo;
-import org.apache.paimon.flink.clone.CloneFilesFunction;
-import org.apache.paimon.flink.clone.CloneUtils;
-import org.apache.paimon.flink.clone.CommitTableOperator;
-import org.apache.paimon.flink.clone.DataFileInfo;
-import org.apache.paimon.flink.clone.ListCloneFilesFunction;
-import org.apache.paimon.flink.sink.FlinkStreamPartitioner;
+import org.apache.paimon.flink.clone.CloneHiveTableUtils;
+import org.apache.paimon.flink.clone.ClonePaimonTableUtils;
 import org.apache.paimon.hive.HiveCatalog;
-
-import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 
 import javax.annotation.Nullable;
 
+import java.util.List;
 import java.util.Map;
 
 /** Clone source table to target table. */
@@ -52,6 +42,9 @@ public class CloneAction extends ActionBase {
 
     private final int parallelism;
     @Nullable private final String whereSql;
+    @Nullable private final List<String> includedTables;
+    @Nullable private final List<String> excludedTables;
+    private final String cloneFrom;
 
     public CloneAction(
             String sourceDatabase,
@@ -61,17 +54,22 @@ public class CloneAction extends ActionBase {
             String targetTableName,
             Map<String, String> targetCatalogConfig,
             @Nullable Integer parallelism,
-            @Nullable String whereSql) {
+            @Nullable String whereSql,
+            @Nullable List<String> includedTables,
+            @Nullable List<String> excludedTables,
+            String cloneFrom) {
         super(sourceCatalogConfig);
 
-        Catalog sourceCatalog = catalog;
-        if (sourceCatalog instanceof CachingCatalog) {
-            sourceCatalog = ((CachingCatalog) sourceCatalog).wrapped();
-        }
-        if (!(sourceCatalog instanceof HiveCatalog)) {
-            throw new UnsupportedOperationException(
-                    "Only support clone hive tables using HiveCatalog, but current source catalog is "
-                            + sourceCatalog.getClass().getName());
+        if (cloneFrom.equalsIgnoreCase("hive")) {
+            Catalog sourceCatalog = catalog;
+            if (sourceCatalog instanceof CachingCatalog) {
+                sourceCatalog = ((CachingCatalog) sourceCatalog).wrapped();
+            }
+            if (!(sourceCatalog instanceof HiveCatalog)) {
+                throw new UnsupportedOperationException(
+                        "Only support clone hive tables using HiveCatalog, but current source catalog is "
+                                + sourceCatalog.getClass().getName());
+            }
         }
 
         this.sourceDatabase = sourceDatabase;
@@ -84,57 +82,50 @@ public class CloneAction extends ActionBase {
 
         this.parallelism = parallelism == null ? env.getParallelism() : parallelism;
         this.whereSql = whereSql;
+        this.includedTables = includedTables;
+        this.excludedTables = excludedTables;
+        this.cloneFrom = cloneFrom;
     }
 
     @Override
     public void build() throws Exception {
-        // list source tables
-        DataStream<Tuple2<Identifier, Identifier>> source =
-                CloneUtils.buildSource(
+        switch (cloneFrom) {
+            case "hive":
+                CloneHiveTableUtils.build(
+                        env,
+                        catalog,
                         sourceDatabase,
                         sourceTableName,
+                        sourceCatalogConfig,
                         targetDatabase,
                         targetTableName,
+                        targetCatalogConfig,
+                        parallelism,
+                        whereSql,
+                        includedTables,
+                        excludedTables);
+                break;
+            case "paimon":
+                ClonePaimonTableUtils.build(
+                        env,
                         catalog,
-                        env);
-
-        DataStream<Tuple2<Identifier, Identifier>> partitionedSource =
-                FlinkStreamPartitioner.partition(
-                        source, new CloneUtils.TableChannelComputer(), parallelism);
-
-        // create target table, list files and group by <table, partition>
-        DataStream<CloneFileInfo> files =
-                partitionedSource
-                        .process(
-                                new ListCloneFilesFunction(
-                                        sourceCatalogConfig, targetCatalogConfig, whereSql))
-                        .name("List Files")
-                        .setParallelism(parallelism);
-
-        // copy files and commit
-        DataStream<DataFileInfo> dataFile =
-                files.rebalance()
-                        .process(new CloneFilesFunction(sourceCatalogConfig, targetCatalogConfig))
-                        .name("Copy Files")
-                        .setParallelism(parallelism);
-
-        DataStream<DataFileInfo> partitionedDataFile =
-                FlinkStreamPartitioner.partition(
-                        dataFile, new CloneUtils.DataFileChannelComputer(), parallelism);
-
-        DataStream<Long> committed =
-                partitionedDataFile
-                        .transform(
-                                "Commit table",
-                                BasicTypeInfo.LONG_TYPE_INFO,
-                                new CommitTableOperator(targetCatalogConfig))
-                        .setParallelism(parallelism);
-        committed.sinkTo(new DiscardingSink<>()).name("end").setParallelism(1);
+                        sourceDatabase,
+                        sourceTableName,
+                        sourceCatalogConfig,
+                        targetDatabase,
+                        targetTableName,
+                        targetCatalogConfig,
+                        parallelism,
+                        whereSql,
+                        includedTables,
+                        excludedTables);
+                break;
+        }
     }
 
     @Override
     public void run() throws Exception {
         build();
-        execute("Clone Hive job");
+        execute("Clone job");
     }
 }

@@ -38,12 +38,59 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.apache.paimon.utils.NextSnapshotFetcher.RANGE_CHECK_INTERVAL;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
 
 /** Tests for {@link StreamTableScan}. */
 public class StreamTableScanTest extends ScannerTestBase {
+
+    @Test
+    public void testIgnoreEmptyPlan() throws Exception {
+        TableRead read = table.newRead();
+        StreamTableWrite write = table.newWrite(commitUser);
+        StreamTableCommit commit = table.newCommit(commitUser);
+
+        // only plan partition 1
+        ReadBuilder readBuilder = table.newReadBuilder();
+        PredicateBuilder predicateBuilder = new PredicateBuilder(readBuilder.readType());
+        readBuilder.withFilter(predicateBuilder.lessOrEqual(0, 1));
+        StreamTableScan scan = readBuilder.newStreamScan();
+
+        // first call without any snapshot, should return empty plan
+        assertThat(scan.plan().splits()).isEmpty();
+
+        // write partition 1
+        write.write(rowData(1, 10, 100L));
+        commit.commit(0, write.prepareCommit(true, 0));
+
+        // first call with snapshot, should return complete records from 1 commit
+        TableScan.Plan plan = scan.plan();
+        assertThat(getResult(read, plan.splits()))
+                .hasSameElementsAs(Collections.singletonList("+I 1|10|100"));
+
+        // write partition 2
+        write.write(rowData(2, 10, 100L));
+        commit.commit(1, write.prepareCommit(true, 1));
+
+        // write partition 1
+        write.write(rowData(1, 20, 200L));
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        // second call with snapshot, should ignore 2 commit and return complete records from 3
+        // commit
+        plan = scan.plan();
+        assertThat(getResult(read, plan.splits()))
+                .hasSameElementsAs(Collections.singletonList("+I 1|20|200"));
+
+        // third call without snapshot
+        plan = scan.plan();
+        assertThat(plan.splits()).isEmpty();
+
+        write.close();
+        commit.close();
+    }
 
     @Test
     public void testPlan() throws Exception {
@@ -323,7 +370,9 @@ public class StreamTableScanTest extends ScannerTestBase {
 
         try {
             // second call with snapshot, should throw an OutOfRangeException
-            scan.plan();
+            for (int i = 0; i < RANGE_CHECK_INTERVAL; i++) {
+                scan.plan();
+            }
             fail("Should throw an OutOfRangeException.");
         } catch (OutOfRangeException ignore) {
             // ignore

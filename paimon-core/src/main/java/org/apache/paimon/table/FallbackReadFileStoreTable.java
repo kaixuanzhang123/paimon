@@ -32,6 +32,7 @@ import org.apache.paimon.io.DataOutputViewStreamWrapper;
 import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
@@ -338,6 +339,13 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
         }
 
         @Override
+        public InnerTableScan withPartitionFilter(PartitionPredicate partitionPredicate) {
+            mainScan.withPartitionFilter(partitionPredicate);
+            fallbackScan.withPartitionFilter(partitionPredicate);
+            return this;
+        }
+
+        @Override
         public FallbackReadScan withBucketFilter(Filter<Integer> bucketFilter) {
             mainScan.withBucketFilter(bucketFilter);
             fallbackScan.withBucketFilter(bucketFilter);
@@ -456,18 +464,21 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
 
         @Override
         public RecordReader<InternalRow> createReader(Split split) throws IOException {
-            FallbackDataSplit dataSplit = (FallbackDataSplit) split;
-            if (dataSplit.isFallback) {
-                try {
-                    return fallbackRead.createReader(dataSplit);
-                } catch (Exception ignored) {
-                    LOG.error(
-                            "Reading from fallback branch has problems for files: {}",
-                            dataSplit.dataFiles().stream()
-                                    .map(DataFileMeta::fileName)
-                                    .collect(Collectors.joining(", ")));
+            if (split instanceof FallbackDataSplit) {
+                FallbackDataSplit fallbackDataSplit = (FallbackDataSplit) split;
+                if (fallbackDataSplit.isFallback) {
+                    try {
+                        return fallbackRead.createReader(fallbackDataSplit);
+                    } catch (Exception ignored) {
+                        LOG.error(
+                                "Reading from fallback branch has problems for files: {}",
+                                fallbackDataSplit.dataFiles().stream()
+                                        .map(DataFileMeta::fileName)
+                                        .collect(Collectors.joining(", ")));
+                    }
                 }
             }
+            DataSplit dataSplit = (DataSplit) split;
             return mainRead.createReader(dataSplit);
         }
     }

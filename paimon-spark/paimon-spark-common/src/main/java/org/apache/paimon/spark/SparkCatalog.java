@@ -37,6 +37,7 @@ import org.apache.paimon.table.FormatTable;
 import org.apache.paimon.table.FormatTableOptions;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.utils.ExceptionUtils;
 import org.apache.paimon.utils.TypeUtils;
 
 import org.apache.spark.sql.PaimonSparkSession$;
@@ -51,7 +52,6 @@ import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.NamespaceChange;
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
-import org.apache.spark.sql.connector.catalog.TableCatalogCapability;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
 import org.apache.spark.sql.connector.expressions.FieldReference;
@@ -79,7 +79,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.FILE_FORMAT;
@@ -96,7 +95,6 @@ import static org.apache.paimon.spark.utils.CatalogUtils.isUpdateColumnDefaultVa
 import static org.apache.paimon.spark.utils.CatalogUtils.removeCatalogName;
 import static org.apache.paimon.spark.utils.CatalogUtils.toIdentifier;
 import static org.apache.paimon.spark.utils.CatalogUtils.toUpdateColumnDefaultValue;
-import static org.apache.spark.sql.connector.catalog.TableCatalogCapability.SUPPORT_COLUMN_DEFAULT_VALUE;
 
 /** Spark {@link TableCatalog} for paimon. */
 public class SparkCatalog extends SparkBaseCatalog
@@ -111,10 +109,6 @@ public class SparkCatalog extends SparkBaseCatalog
 
     private String defaultDatabase;
 
-    public Set<TableCatalogCapability> capabilities() {
-        return Collections.singleton(SUPPORT_COLUMN_DEFAULT_VALUE);
-    }
-
     @Override
     public void initialize(String name, CaseInsensitiveStringMap options) {
         checkRequiredConfigurations();
@@ -128,8 +122,12 @@ public class SparkCatalog extends SparkBaseCatalog
         this.defaultDatabase =
                 options.getOrDefault(DEFAULT_DATABASE.key(), DEFAULT_DATABASE.defaultValue());
         try {
-            catalog.getDatabase(defaultNamespace()[0]);
+            catalog.getDatabase(defaultDatabase);
         } catch (Catalog.DatabaseNotExistException e) {
+            LOG.warn(
+                    "Default database '{}' does not exist, caused by: {}, start to create it",
+                    defaultDatabase,
+                    ExceptionUtils.stringifyException(e));
             try {
                 createNamespace(defaultNamespace(), new HashMap<>());
             } catch (NamespaceAlreadyExistsException ignored) {

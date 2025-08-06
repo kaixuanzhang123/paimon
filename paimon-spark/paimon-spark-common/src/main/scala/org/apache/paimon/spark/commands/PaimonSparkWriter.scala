@@ -31,11 +31,12 @@ import org.apache.paimon.manifest.FileKind
 import org.apache.paimon.spark.{SparkRow, SparkTableWrite, SparkTypeUtils}
 import org.apache.paimon.spark.catalog.functions.BucketFunction
 import org.apache.paimon.spark.schema.SparkSystemColumns.{BUCKET_COL, ROW_KIND_COL}
+import org.apache.paimon.spark.sort.TableSorter
 import org.apache.paimon.spark.util.OptionUtils.paimonExtensionEnabled
 import org.apache.paimon.spark.util.SparkRowUtils
 import org.apache.paimon.spark.write.WriteHelper
+import org.apache.paimon.table.{FileStoreTable, SpecialFields}
 import org.apache.paimon.table.BucketMode._
-import org.apache.paimon.table.FileStoreTable
 import org.apache.paimon.table.sink._
 import org.apache.paimon.types.{RowKind, RowType}
 import org.apache.paimon.utils.SerializationUtils
@@ -50,20 +51,35 @@ import java.util.Collections.singletonMap
 
 import scala.collection.JavaConverters._
 
-case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
+case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = false)
+  extends WriteHelper {
 
   private lazy val tableSchema = table.schema
-
-  private lazy val rowType = table.rowType()
 
   private lazy val bucketMode = table.bucketMode
 
   @transient private lazy val serializer = new CommitMessageSerializer
 
+  private val writeType = {
+    if (writeRowLineage) {
+      SpecialFields.rowTypeWithRowLineage(table.rowType(), true)
+    } else {
+      table.rowType()
+    }
+  }
+
   val writeBuilder: BatchWriteBuilder = table.newBatchWriteBuilder()
 
   def writeOnly(): PaimonSparkWriter = {
     PaimonSparkWriter(table.copy(singletonMap(WRITE_ONLY.key(), "true")))
+  }
+
+  def withRowLineage(): PaimonSparkWriter = {
+    if (coreOptions.rowTrackingEnabled()) {
+      PaimonSparkWriter(table, writeRowLineage = true)
+    } else {
+      this
+    }
   }
 
   def write(data: DataFrame): Seq[CommitMessage] = {
@@ -82,7 +98,7 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
     val bucketColIdx = SparkRowUtils.getFieldIndex(withInitBucketCol.schema, BUCKET_COL)
     val encoderGroupWithBucketCol = EncoderSerDeGroup(withInitBucketCol.schema)
 
-    def newWrite(): SparkTableWrite = new SparkTableWrite(writeBuilder, rowType, rowKindColIdx)
+    def newWrite() = SparkTableWrite(writeBuilder, writeType, rowKindColIdx, writeRowLineage)
 
     def sparkParallelism = {
       val defaultParallelism = sparkSession.sparkContext.defaultParallelism
@@ -212,7 +228,7 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
                   coreOptions.dynamicBucketMaxBuckets
                 )
               row => {
-                val sparkRow = new SparkRow(rowType, row)
+                val sparkRow = new SparkRow(writeType, row)
                 assigner.assign(
                   extractor.partition(sparkRow),
                   extractor.trimmedPrimaryKey(sparkRow).hashCode)
@@ -233,15 +249,21 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
         }
 
       case BUCKET_UNAWARE | POSTPONE_MODE =>
-        if (
-          coreOptions.partitionSinkStrategy().equals(PartitionSinkStrategy.HASH) && !tableSchema
-            .partitionKeys()
-            .isEmpty
-        ) {
-          writeWithoutBucket(data.repartition(partitionCols(data): _*))
-        } else {
-          writeWithoutBucket(data)
+        var input = data
+        if (tableSchema.partitionKeys().size() > 0) {
+          coreOptions.partitionSinkStrategy match {
+            case PartitionSinkStrategy.HASH =>
+              input = data.repartition(partitionCols(data): _*)
+            case _ =>
+          }
         }
+        val clusteringColumns = coreOptions.clusteringColumns()
+        if (!clusteringColumns.isEmpty) {
+          val strategy = coreOptions.clusteringStrategy(tableSchema.fields().size())
+          val sorter = TableSorter.getSorter(table, strategy, clusteringColumns)
+          input = sorter.sort(data)
+        }
+        writeWithoutBucket(input)
 
       case HASH_FIXED =>
         if (paimonExtensionEnabled && BucketFunction.supportsTable(table)) {
@@ -368,6 +390,7 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
               .bootstrap(numSparkPartitions, sparkPartitionId)
               .toCloseableIterator
             TaskContext.get().addTaskCompletionListener[Unit](_ => bootstrapIterator.close())
+            val toPaimonRow = SparkRowUtils.toPaimonRow(rowType, rowKindColIdx)
 
             bootstrapIterator.asScala
               .map(
@@ -377,8 +400,7 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
                   (keyPartProject(row).hashCode(), (KeyPartOrRow.KEY_PART, bytes))
                 }) ++ iter.map(
               r => {
-                val sparkRow =
-                  new SparkRow(rowType, r, SparkRowUtils.getRowKind(r, rowKindColIdx))
+                val sparkRow = toPaimonRow(r)
                 val bytes: Array[Byte] =
                   SerializationUtils.serializeBinaryRow(rowSer.toBinaryRow(sparkRow))
                 (rowProject(sparkRow).hashCode(), (KeyPartOrRow.ROW, bytes))
@@ -402,7 +424,7 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
             val rowPartitionKeyExtractor = new RowPartitionKeyExtractor(tableSchema)
             iterator.map(
               row => {
-                val sparkRow = new SparkRow(rowType, row)
+                val sparkRow = new SparkRow(writeType, row)
                 val partitionHash = rowPartitionKeyExtractor.partition(sparkRow).hashCode
                 val keyHash = rowPartitionKeyExtractor.trimmedPrimaryKey(sparkRow).hashCode
                 (
@@ -445,5 +467,12 @@ case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
   private case class ModPartitioner(partitions: Int) extends Partitioner {
     override def numPartitions: Int = partitions
     override def getPartition(key: Any): Int = Math.abs(key.asInstanceOf[Int] % numPartitions)
+  }
+}
+
+object PaimonSparkWriter {
+
+  def apply(table: FileStoreTable): PaimonSparkWriter = {
+    new PaimonSparkWriter(table)
   }
 }

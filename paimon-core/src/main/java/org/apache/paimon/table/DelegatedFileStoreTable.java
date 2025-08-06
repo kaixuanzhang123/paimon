@@ -39,6 +39,7 @@ import org.apache.paimon.table.source.DataTableScan;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.utils.BranchManager;
 import org.apache.paimon.utils.ChangelogManager;
 import org.apache.paimon.utils.SegmentsCache;
@@ -221,6 +222,11 @@ public abstract class DelegatedFileStoreTable implements FileStoreTable {
     @Override
     public void createTag(String tagName, long fromSnapshotId, Duration timeRetained) {
         wrapped.createTag(tagName, fromSnapshotId, timeRetained);
+    }
+
+    @Override
+    public TagAutoManager newTagAutoManager() {
+        return wrapped.newTagAutoManager();
     }
 
     @Override

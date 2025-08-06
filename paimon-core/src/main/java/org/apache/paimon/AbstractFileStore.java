@@ -302,7 +302,10 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
                 createCommitCallbacks(commitUser, table),
                 options.commitMaxRetries(),
                 options.commitTimeout(),
-                options.commitStrictModeLastSafeSnapshot().orElse(null));
+                options.commitMinRetryWait(),
+                options.commitMaxRetryWait(),
+                options.commitStrictModeLastSafeSnapshot().orElse(null),
+                options.rowTrackingEnabled());
     }
 
     @Override
@@ -354,7 +357,7 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
 
     private List<CommitCallback> createCommitCallbacks(String commitUser, FileStoreTable table) {
         List<CommitCallback> callbacks =
-                new ArrayList<>(CallbackUtils.loadCommitCallbacks(options));
+                new ArrayList<>(CallbackUtils.loadCommitCallbacks(options, table));
 
         if (options.partitionedTableInMetastore() && !schema.partitionKeys().isEmpty()) {
             PartitionHandler partitionHandler = catalogEnvironment.partitionHandler();
@@ -437,7 +440,7 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
     }
 
     @Override
-    public TagAutoManager newTagCreationManager(FileStoreTable table) {
+    public TagAutoManager newTagAutoManager(FileStoreTable table) {
         return TagAutoManager.create(
                 options,
                 snapshotManager(),

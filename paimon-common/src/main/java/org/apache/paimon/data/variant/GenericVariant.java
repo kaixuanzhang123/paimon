@@ -35,6 +35,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.UUID;
 
 import static org.apache.paimon.data.variant.GenericVariantUtil.BINARY_SEARCH_THRESHOLD;
 import static org.apache.paimon.data.variant.GenericVariantUtil.SIZE_LIMIT;
@@ -122,7 +123,7 @@ public final class GenericVariant implements Variant {
         return Objects.hash(Arrays.hashCode(value), Arrays.hashCode(metadata), pos);
     }
 
-    public static Variant fromJson(String json) {
+    public static GenericVariant fromJson(String json) {
         try {
             return GenericVariantBuilder.parseJson(json, false);
         } catch (IOException e) {
@@ -239,6 +240,11 @@ public final class GenericVariant implements Variant {
         return GenericVariantUtil.getType(value, pos);
     }
 
+    // Get a UUID value from the variant.
+    public UUID getUuid() {
+        return GenericVariantUtil.getUuid(value, pos);
+    }
+
     // Get the number of object fields in the variant.
     // It is only legal to call it when `getType()` is `Type.OBJECT`.
     public int objectSize() {
@@ -294,9 +300,9 @@ public final class GenericVariant implements Variant {
     /** Variant object field. */
     public static final class ObjectField {
         public final String key;
-        public final Variant value;
+        public final GenericVariant value;
 
-        public ObjectField(String key, Variant value) {
+        public ObjectField(String key, GenericVariant value) {
             this.key = key;
             this.value = value;
         }
@@ -316,7 +322,7 @@ public final class GenericVariant implements Variant {
                     int id = readUnsigned(value, idStart + idSize * index, idSize);
                     int offset = readUnsigned(value, offsetStart + offsetSize * index, offsetSize);
                     String key = getMetadataKey(metadata, id);
-                    Variant v = new GenericVariant(value, metadata, dataStart + offset);
+                    GenericVariant v = new GenericVariant(value, metadata, dataStart + offset);
                     return new ObjectField(key, v);
                 });
     }
@@ -456,8 +462,15 @@ public final class GenericVariant implements Variant {
                 sb.append(escapeJson(GenericVariantUtil.getString(value, pos)));
                 break;
             case DOUBLE:
-                sb.append(GenericVariantUtil.getDouble(value, pos));
-                break;
+                {
+                    double d = GenericVariantUtil.getDouble(value, pos);
+                    if (Double.isFinite(d)) {
+                        sb.append(d);
+                    } else {
+                        appendQuoted(sb, Double.toString(d));
+                    }
+                    break;
+                }
             case DECIMAL:
                 sb.append(GenericVariantUtil.getDecimal(value, pos).toPlainString());
                 break;
@@ -482,13 +495,23 @@ public final class GenericVariant implements Variant {
                                         .atZone(ZoneOffset.UTC)));
                 break;
             case FLOAT:
-                sb.append(GenericVariantUtil.getFloat(value, pos));
-                break;
+                {
+                    float f = GenericVariantUtil.getFloat(value, pos);
+                    if (Float.isFinite(f)) {
+                        sb.append(f);
+                    } else {
+                        appendQuoted(sb, Float.toString(f));
+                    }
+                    break;
+                }
             case BINARY:
                 appendQuoted(
                         sb,
                         Base64.getEncoder()
                                 .encodeToString(GenericVariantUtil.getBinary(value, pos)));
+                break;
+            case UUID:
+                appendQuoted(sb, GenericVariantUtil.getUuid(value, pos).toString());
                 break;
         }
     }

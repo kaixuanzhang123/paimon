@@ -43,6 +43,7 @@ import javax.annotation.Nullable;
 import java.io.Serializable;
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -57,6 +58,9 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.MergeEngine.FIRST_ROW;
+import static org.apache.paimon.CoreOptions.OrderType.HILBERT;
+import static org.apache.paimon.CoreOptions.OrderType.ORDER;
+import static org.apache.paimon.CoreOptions.OrderType.ZORDER;
 import static org.apache.paimon.options.ConfigOptions.key;
 import static org.apache.paimon.options.MemorySize.VALUE_128_MB;
 import static org.apache.paimon.options.MemorySize.VALUE_256_MB;
@@ -122,6 +126,13 @@ public class CoreOptions implements Serializable {
                                             "If not specified, the primary key will be used; "
                                                     + "if there is no primary key, the full row will be used.")
                                     .build());
+
+    public static final ConfigOption<Boolean> BUCKET_APPEND_ORDERED =
+            key("bucket-append-ordered")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to ignore the order of the buckets when reading data from an append-only table.");
 
     @Immutable
     public static final ConfigOption<BucketFunctionType> BUCKET_FUNCTION_TYPE =
@@ -355,6 +366,13 @@ public class CoreOptions implements Serializable {
                             "To avoid frequent manifest merges, this parameter specifies the minimum number "
                                     + "of ManifestFileMeta to merge.");
 
+    public static final ConfigOption<String> UPSERT_KEY =
+            key("upsert-key")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Define upsert key to do MERGE INTO when executing INSERT INTO, cannot be defined with primary key.");
+
     public static final ConfigOption<String> PARTITION_DEFAULT_NAME =
             key("partition.default-name")
                     .stringType()
@@ -546,9 +564,8 @@ public class CoreOptions implements Serializable {
     public static final ConfigOption<Boolean> WRITE_BUFFER_SPILLABLE =
             key("write-buffer-spillable")
                     .booleanType()
-                    .noDefaultValue()
-                    .withDescription(
-                            "Whether the write buffer can be spillable. Enabled by default when using object storage or when 'target-file-size' is greater than 'write-buffer-size'.");
+                    .defaultValue(true)
+                    .withDescription("Whether the write buffer can be spillable.");
 
     public static final ConfigOption<Boolean> WRITE_BUFFER_FOR_APPEND =
             key("write-buffer-for-append")
@@ -638,6 +655,18 @@ public class CoreOptions implements Serializable {
                     .defaultValue(10)
                     .withDescription("Maximum number of retries when commit failed.");
 
+    public static final ConfigOption<Duration> COMMIT_MIN_RETRY_WAIT =
+            key("commit.min-retry-wait")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(10))
+                    .withDescription("Min retry wait time when commit failed.");
+
+    public static final ConfigOption<Duration> COMMIT_MAX_RETRY_WAIT =
+            key("commit.max-retry-wait")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(10))
+                    .withDescription("Max retry wait time when commit failed.");
+
     public static final ConfigOption<Integer> COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT =
             key("compaction.max-size-amplification-percent")
                     .intType()
@@ -662,6 +691,40 @@ public class CoreOptions implements Serializable {
                                     + "size is 1% smaller than the next sorted run's size, then include next sorted run "
                                     + "into this candidate set.");
 
+    public static final ConfigOption<Integer> COMPACT_OFFPEAK_START_HOUR =
+            key("compaction.offpeak.start.hour")
+                    .intType()
+                    .defaultValue(-1)
+                    .withDescription(
+                            "The start of off-peak hours, expressed as an integer between 0 and 23, inclusive"
+                                    + " Set to -1 to disable off-peak");
+
+    public static final ConfigOption<Integer> COMPACT_OFFPEAK_END_HOUR =
+            key("compaction.offpeak.end.hour")
+                    .intType()
+                    .defaultValue(-1)
+                    .withDescription(
+                            "The end of off-peak hours, expressed as an integer between 0 and 23, inclusive. Set"
+                                    + " to -1 to disable off-peak.");
+
+    public static final ConfigOption<Integer> COMPACTION_OFFPEAK_RATIO =
+            key("compaction.offpeak-ratio")
+                    .intType()
+                    .defaultValue(0)
+                    .withDescription(
+                            Description.builder()
+                                    .text(
+                                            "Allows you to set a different (by default, more aggressive) percentage ratio for determining "
+                                                    + " whether larger sorted run's size are included in compactions during off-peak hours. Works in the "
+                                                    + " same way as compaction.size-ratio. Only applies if offpeak.start.hour and "
+                                                    + " offpeak.end.hour are also enabled. ")
+                                    .linebreak()
+                                    .text(
+                                            " For instance, if your cluster experiences low pressure between 2 AM  and 6 PM , "
+                                                    + " you can configure `compaction.offpeak.start.hour=2` and `compaction.offpeak.end.hour=18` to define this period as off-peak hours. "
+                                                    + " During these hours, you can increase the off-peak compaction ratio (e.g. `compaction.offpeak-ratio=20`) to enable more aggressive data compaction")
+                                    .build());
+
     public static final ConfigOption<Duration> COMPACTION_OPTIMIZATION_INTERVAL =
             key("compaction.optimization-interval")
                     .durationType()
@@ -669,6 +732,13 @@ public class CoreOptions implements Serializable {
                     .withDescription(
                             "Implying how often to perform an optimization compaction, this configuration is used to "
                                     + "ensure the query timeliness of the read-optimized system table.");
+
+    public static final ConfigOption<MemorySize> COMPACTION_TOTAL_SIZE_THRESHOLD =
+            key("compaction.total-size-threshold")
+                    .memoryType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "When total size is smaller than this threshold, force a full compaction.");
 
     public static final ConfigOption<Integer> COMPACTION_MIN_FILE_NUM =
             key("compaction.min.file-num")
@@ -1109,6 +1179,12 @@ public class CoreOptions implements Serializable {
                     .withFallbackKeys("orc.write.batch-size")
                     .withDescription("Write batch size for any file format if it supports.");
 
+    public static final ConfigOption<MemorySize> WRITE_BATCH_MEMORY =
+            key("write.batch-memory")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("128 mb"))
+                    .withDescription("Write batch memory for any file format if it supports.");
+
     public static final ConfigOption<String> CONSUMER_ID =
             key("consumer-id")
                     .stringType()
@@ -1524,6 +1600,16 @@ public class CoreOptions implements Serializable {
                                     + " the value should be the user configured local time zone. The option value is either a full name"
                                     + " such as 'America/Los_Angeles', or a custom timezone id such as 'GMT-08:00'.");
 
+    public static final ConfigOption<String> SINK_PROCESS_TIME_ZONE =
+            key("sink.process-time-zone")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The time zone to parse the long process time to TIMESTAMP value. The default value is JVM's "
+                                    + "default time zone. If you want to specify a time zone, you should either set a "
+                                    + "full name such as 'America/Los_Angeles' or a custom zone id such as 'GMT-08:00'. "
+                                    + "This option currently is used for extract tag name.");
+
     public static final ConfigOption<MemorySize> LOCAL_MERGE_BUFFER_SIZE =
             key("local-merge-buffer-size")
                     .memoryType()
@@ -1817,6 +1903,40 @@ public class CoreOptions implements Serializable {
                                     + "starting from the snapshot after this one. If found, commit will be aborted. "
                                     + "If the value of this option is -1, committer will not check for its first commit.");
 
+    public static final ConfigOption<String> CLUSTERING_COLUMNS =
+            key("clustering.columns")
+                    .stringType()
+                    .noDefaultValue()
+                    .withFallbackKeys("sink.clustering.by-columns")
+                    .withDescription(
+                            "Specifies the column name(s) used for comparison during range partitioning, in the format 'columnName1,columnName2'. "
+                                    + "If not set or set to an empty string, it indicates that the range partitioning feature is not enabled. "
+                                    + "This option will be effective only for append table without primary keys and batch execution mode.");
+
+    public static final ConfigOption<String> CLUSTERING_STRATEGY =
+            key("clustering.strategy")
+                    .stringType()
+                    .defaultValue("auto")
+                    .withFallbackKeys("sink.clustering.strategy")
+                    .withDescription(
+                            "Specifies the comparison algorithm used for range partitioning, including 'zorder', 'hilbert', and 'order', "
+                                    + "corresponding to the z-order curve algorithm, hilbert curve algorithm, and basic type comparison algorithm, "
+                                    + "respectively. When not configured, it will automatically determine the algorithm based on the number of columns "
+                                    + "in 'sink.clustering.by-columns'. 'order' is used for 1 column, 'zorder' for less than 5 columns, "
+                                    + "and 'hilbert' for 5 or more columns.");
+
+    public static final ConfigOption<Boolean> ROW_TRACKING_ENABLED =
+            key("row-tracking.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Whether enable unique row id for append table.");
+
+    public static final ConfigOption<Boolean> SNAPSHOT_IGNORE_EMPTY_COMMIT =
+            key("snapshot.ignore-empty-commit")
+                    .booleanType()
+                    .noDefaultValue()
+                    .withDescription("Whether ignore empty commit.");
+
     private final Options options;
 
     public CoreOptions(Map<String, String> options) {
@@ -1940,7 +2060,7 @@ public class CoreOptions implements Serializable {
     }
 
     public static String normalizeFileFormat(String fileFormat) {
-        return fileFormat.toLowerCase();
+        return StringUtils.isEmpty(fileFormat) ? fileFormat : fileFormat.toLowerCase();
     }
 
     public String dataFilePrefix() {
@@ -1958,7 +2078,7 @@ public class CoreOptions implements Serializable {
 
     @Nullable
     public String changelogFileFormat() {
-        return options.get(CHANGELOG_FILE_FORMAT);
+        return normalizeFileFormat(options.get(CHANGELOG_FILE_FORMAT));
     }
 
     @Nullable
@@ -1977,6 +2097,14 @@ public class CoreOptions implements Serializable {
 
     public String fieldsDefaultFunc() {
         return options.get(FIELDS_DEFAULT_AGG_FUNC);
+    }
+
+    public List<String> upsertKey() {
+        String upsertKey = options.get(UPSERT_KEY);
+        if (StringUtils.isEmpty(upsertKey)) {
+            return Collections.emptyList();
+        }
+        return Arrays.asList(upsertKey.split(","));
     }
 
     public static String createCommitUser(Options options) {
@@ -2160,14 +2288,8 @@ public class CoreOptions implements Serializable {
         return options.get(WRITE_BUFFER_SIZE).getBytes();
     }
 
-    public boolean writeBufferSpillable(
-            boolean usingObjectStore, boolean isStreaming, boolean hasPrimaryKey) {
-        // if not streaming mode, we turn spillable on by default.
-        return options.getOptional(WRITE_BUFFER_SPILLABLE)
-                .orElse(
-                        usingObjectStore
-                                || !isStreaming
-                                || targetFileSize(hasPrimaryKey) > writeBufferSize());
+    public boolean writeBufferSpillable() {
+        return options.get(WRITE_BUFFER_SPILLABLE);
     }
 
     public MemorySize writeBufferSpillDiskSize() {
@@ -2255,6 +2377,11 @@ public class CoreOptions implements Serializable {
         return options.get(COMPACTION_OPTIMIZATION_INTERVAL);
     }
 
+    @Nullable
+    public MemorySize compactionTotalSizeThreshold() {
+        return options.get(COMPACTION_TOTAL_SIZE_THRESHOLD);
+    }
+
     public int numSortedRunStopTrigger() {
         Integer stopTrigger = options.get(NUM_SORTED_RUNS_STOP_TRIGGER);
         if (stopTrigger == null) {
@@ -2283,6 +2410,14 @@ public class CoreOptions implements Serializable {
                 : options.get(COMMIT_TIMEOUT).toMillis();
     }
 
+    public long commitMinRetryWait() {
+        return options.get(COMMIT_MIN_RETRY_WAIT).toMillis();
+    }
+
+    public long commitMaxRetryWait() {
+        return options.get(COMMIT_MAX_RETRY_WAIT).toMillis();
+    }
+
     public int commitMaxRetries() {
         return options.get(COMMIT_MAX_RETRIES);
     }
@@ -2297,6 +2432,18 @@ public class CoreOptions implements Serializable {
 
     public int sortedRunSizeRatio() {
         return options.get(COMPACTION_SIZE_RATIO);
+    }
+
+    public int compactOffPeakStartHour() {
+        return options.get(COMPACT_OFFPEAK_START_HOUR);
+    }
+
+    public int compactOffPeakEndHour() {
+        return options.get(COMPACT_OFFPEAK_END_HOUR);
+    }
+
+    public int compactOffPeakRatio() {
+        return options.get(COMPACTION_OFFPEAK_RATIO);
     }
 
     public int compactionMinFileNum() {
@@ -2642,6 +2789,11 @@ public class CoreOptions implements Serializable {
         return options.get(SINK_WATERMARK_TIME_ZONE);
     }
 
+    public ZoneId sinkProcessTimeZone() {
+        String zoneId = options.get(SINK_PROCESS_TIME_ZONE);
+        return zoneId == null ? ZoneId.systemDefault() : ZoneId.of(zoneId);
+    }
+
     public boolean forceCreatingSnapshot() {
         return options.get(COMMIT_FORCE_CREATE_SNAPSHOT);
     }
@@ -2739,6 +2891,10 @@ public class CoreOptions implements Serializable {
         return options.get(RECORD_LEVEL_TIME_FIELD);
     }
 
+    public boolean rowTrackingEnabled() {
+        return options.get(ROW_TRACKING_ENABLED);
+    }
+
     public boolean prepareCommitWaitCompaction() {
         if (!needLookup()) {
             return false;
@@ -2781,6 +2937,35 @@ public class CoreOptions implements Serializable {
 
     public Optional<Long> commitStrictModeLastSafeSnapshot() {
         return options.getOptional(COMMIT_STRICT_MODE_LAST_SAFE_SNAPSHOT);
+    }
+
+    public List<String> clusteringColumns() {
+        return clusteringColumns(options.get(CLUSTERING_COLUMNS));
+    }
+
+    public OrderType clusteringStrategy(int columnSize) {
+        return clusteringStrategy(options.get(CLUSTERING_STRATEGY), columnSize);
+    }
+
+    public static List<String> clusteringColumns(String clusteringColumns) {
+        if (clusteringColumns == null || clusteringColumns.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return Arrays.asList(clusteringColumns.split(","));
+    }
+
+    public static OrderType clusteringStrategy(String clusteringStrategy, int columnSize) {
+        if (clusteringStrategy.equals(CLUSTERING_STRATEGY.defaultValue())) {
+            if (columnSize == 1) {
+                return ORDER;
+            } else if (columnSize < 5) {
+                return ZORDER;
+            } else {
+                return HILBERT;
+            }
+        } else {
+            return OrderType.of(clusteringStrategy);
+        }
     }
 
     /** Specifies the merge engine for table with primary key. */

@@ -63,6 +63,7 @@ under the License.
         <module>paimon-filesystems</module>
         <module>paimon-format</module>
         <module>paimon-lance</module>
+        <module>paimon-vfs</module>
         <module>paimon-bundle</module>
         <module>paimon-hive</module>
         <module>paimon-spark</module>
@@ -133,7 +134,10 @@ under the License.
         <zstd-jni.version>1.5.5-11</zstd-jni.version>
         <janino.version>3.0.11</janino.version>
         <mockito.version>3.4.6</mockito.version>
+        <mockito-junit-jupiter.version>4.11.0</mockito-junit-jupiter.version>
         <okhttp.version>4.12.0</okhttp.version>
+        <apache.hc.core.version>5.3.3</apache.hc.core.version>
+        <apache.hc.client.version>5.4.2</apache.hc.client.version>
         <jaxb.api.version>2.3.1</jaxb.api.version>
         <findbugs.version>1.3.9</findbugs.version>
         <json-smart.version>2.5.2</json-smart.version>
@@ -366,6 +370,26 @@ under the License.
         </profile>
 
         <profile>
+            <id>paimon-website-javadoc</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.1.1</version><!--$NO-MVN-MAN-VER$-->
+                        <configuration>
+                            <quiet>true</quiet>
+                            <detectOfflineLinks>false</detectOfflineLinks>
+                            <additionalJOptions combine.children="append">
+                                <additionalJOption>-Xdoclint:none</additionalJOption>
+                            </additionalJOptions>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
             <id>spark3</id>
             <modules>
                 <module>paimon-spark/paimon-spark3-common</module>
@@ -423,14 +447,12 @@ under the License.
                 <test.flink.version>1.20.1</test.flink.version>
             </properties>
             <modules>
-                <module>paimon-flink/paimon-flink1-common</module>
                 <module>paimon-flink/paimon-flink-1.15</module>
                 <module>paimon-flink/paimon-flink-1.16</module>
                 <module>paimon-flink/paimon-flink-1.17</module>
                 <module>paimon-flink/paimon-flink-1.18</module>
                 <module>paimon-flink/paimon-flink-1.19</module>
                 <module>paimon-flink/paimon-flink-1.20</module>
-                <module>paimon-flink/paimon-flink-cdc</module>
             </modules>
             <activation>
                 <activeByDefault>true</activeByDefault>
@@ -968,16 +990,19 @@ under the License.
                     </executions>
                 </plugin>
 
-
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-javadoc-plugin</artifactId>
-                    <version>3.1.1</version><!--$NO-MVN-MAN-VER$-->
+                    <version>3.11.2</version><!--$NO-MVN-MAN-VER$-->
                     <configuration>
                         <quiet>true</quiet>
                         <detectOfflineLinks>false</detectOfflineLinks>
-                        <additionalJOptions combine.children="append">
+                        <release>8</release>
+                        <failOnError>false</failOnError>
+                        <additionalJOptions>
                             <additionalJOption>-Xdoclint:none</additionalJOption>
+                            <!-- Suppress the error that is accepted by JDK 8 but not by JDK 11. -->
+                            <additionalJOption>--ignore-source-errors</additionalJOption>
                         </additionalJOptions>
                     </configuration>
                 </plugin>

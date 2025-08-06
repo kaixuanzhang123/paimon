@@ -34,6 +34,7 @@ import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableList;
 
 import org.apache.flink.table.api.SqlDialect;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.assertj.core.api.Assertions;
@@ -47,6 +48,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -67,6 +69,91 @@ public class CloneActionITCase extends ActionITCaseBase {
     @AfterAll
     public static void afterAll() throws Exception {
         TEST_HIVE_METASTORE.stop();
+    }
+
+    @Test
+    public void testClonePKTableFromPaimon() throws Exception {
+        TableEnvironment tEnv =
+                tableEnvironmentBuilder()
+                        .batchMode()
+                        .setConf(TableConfigOptions.TABLE_DML_SYNC, true)
+                        .build();
+        String warehouse1 = getTempDirPath();
+        String warehouse2 = getTempDirPath();
+        sql(tEnv, "CREATE CATALOG catalog1 WITH ('type'='paimon', 'warehouse' = '%s')", warehouse1);
+        sql(tEnv, "CREATE CATALOG catalog2 WITH ('type'='paimon', 'warehouse' = '%s')", warehouse2);
+
+        sql(
+                tEnv,
+                "CREATE TABLE catalog1.`default`.src (a INT, b INT, PRIMARY KEY (a) NOT ENFORCED)");
+        sql(tEnv, "INSERT INTO catalog1.`default`.src VALUES (1, 1), (2, 2)");
+        createAction(
+                        CloneAction.class,
+                        "clone",
+                        "--database",
+                        "default",
+                        "--table",
+                        "src",
+                        "--catalog_conf",
+                        "warehouse=" + warehouse1,
+                        "--target_database",
+                        "default",
+                        "--target_table",
+                        "target",
+                        "--target_catalog_conf",
+                        "warehouse=" + warehouse2,
+                        "--clone_from",
+                        "paimon")
+                .run();
+
+        sql(tEnv, "CALL catalog2.sys.compact(`table` => 'default.target')");
+        List<Row> result = sql(tEnv, "SELECT * FROM catalog2.`default`.target");
+        assertThat(result).containsExactlyInAnyOrder(Row.of(1, 1), Row.of(2, 2));
+        List<Row> show = sql(tEnv, "SHOW CREATE TABLE catalog2.`default`.target");
+        assertThat(show.toString()).contains("PRIMARY KEY");
+    }
+
+    @Test
+    public void testCloneBucketedAppendFromPaimon() throws Exception {
+        TableEnvironment tEnv =
+                tableEnvironmentBuilder()
+                        .batchMode()
+                        .setConf(TableConfigOptions.TABLE_DML_SYNC, true)
+                        .build();
+        String warehouse1 = getTempDirPath();
+        String warehouse2 = getTempDirPath();
+        sql(tEnv, "CREATE CATALOG catalog1 WITH ('type'='paimon', 'warehouse' = '%s')", warehouse1);
+        sql(tEnv, "CREATE CATALOG catalog2 WITH ('type'='paimon', 'warehouse' = '%s')", warehouse2);
+
+        sql(
+                tEnv,
+                "CREATE TABLE catalog1.`default`.src (a INT, b INT) WITH ('bucket' = '2', 'bucket-key' = 'b')");
+        sql(tEnv, "INSERT INTO catalog1.`default`.src VALUES (1, 1), (2, 2)");
+        createAction(
+                        CloneAction.class,
+                        "clone",
+                        "--database",
+                        "default",
+                        "--table",
+                        "src",
+                        "--catalog_conf",
+                        "warehouse=" + warehouse1,
+                        "--target_database",
+                        "default",
+                        "--target_table",
+                        "target",
+                        "--target_catalog_conf",
+                        "warehouse=" + warehouse2,
+                        "--clone_from",
+                        "paimon")
+                .run();
+
+        sql(tEnv, "CALL catalog2.sys.compact(`table` => 'default.target')");
+        List<Row> result = sql(tEnv, "SELECT * FROM catalog2.`default`.target");
+        assertThat(result).containsExactlyInAnyOrder(Row.of(1, 1), Row.of(2, 2));
+        List<Row> show = sql(tEnv, "SHOW CREATE TABLE catalog2.`default`.target");
+        assertThat(show.toString()).contains("'bucket' = '2'");
+        assertThat(show.toString()).contains("'bucket-key' = 'b'");
     }
 
     @Test
@@ -575,6 +662,168 @@ public class CloneActionITCase extends ActionITCaseBase {
 
         List<Row> r2 = sql(tEnv, "SELECT * FROM test.test_table");
         Assertions.assertThatList(r1).containsExactlyInAnyOrderElementsOf(r2);
+    }
+
+    @Test
+    public void testMigrateWholeCatalogWithExcludedTables() throws Exception {
+        String dbName1 = "hivedb" + StringUtils.randomNumericString(10);
+        String tableName1 = "hivetable1" + StringUtils.randomNumericString(10);
+        String tableName2 = "hivetable2" + StringUtils.randomNumericString(10);
+
+        String dbName2 = "hivedb" + StringUtils.randomNumericString(10);
+        String tableName3 = "hivetable1" + StringUtils.randomNumericString(10);
+        String tableName4 = "hivetable2" + StringUtils.randomNumericString(10);
+
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().build();
+        tEnv.executeSql("CREATE CATALOG HIVE WITH ('type'='hive')");
+        tEnv.useCatalog("HIVE");
+        tEnv.getConfig().setSqlDialect(SqlDialect.HIVE);
+        tEnv.executeSql("CREATE DATABASE " + dbName1);
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING, id2 INT, id3 INT) STORED AS %s",
+                dbName1,
+                tableName1,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName1, tableName1, data(100));
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING) PARTITIONED BY (id2 INT, id3 INT) STORED AS %s",
+                dbName1,
+                tableName2,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName1, tableName2, data(100));
+
+        tEnv.executeSql("CREATE DATABASE " + dbName2);
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING, id2 INT, id3 INT) STORED AS %s",
+                dbName2,
+                tableName3,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName2, tableName3, data(100));
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING) PARTITIONED BY (id2 INT, id3 INT) STORED AS %s",
+                dbName2,
+                tableName4,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName2, tableName4, data(100));
+
+        tEnv.getConfig().setSqlDialect(SqlDialect.DEFAULT);
+        tEnv.executeSql("CREATE CATALOG PAIMON_GE WITH ('type'='paimon-generic')");
+        tEnv.useCatalog("PAIMON_GE");
+        List<String> db1Tables = ImmutableList.of(tableName2);
+        List<String> db2Tables = ImmutableList.of(tableName4);
+
+        sql(tEnv, "CREATE CATALOG PAIMON WITH ('type'='paimon', 'warehouse' = '%s')", warehouse);
+        tEnv.useCatalog("PAIMON");
+
+        createAction(
+                        CloneAction.class,
+                        "clone",
+                        "--catalog_conf",
+                        "metastore=hive",
+                        "--catalog_conf",
+                        "uri=thrift://localhost:" + PORT,
+                        "--target_catalog_conf",
+                        "warehouse=" + warehouse,
+                        "--excluded_tables",
+                        dbName1 + "." + tableName1 + "," + dbName2 + "." + tableName3)
+                .run();
+
+        List<String> actualDB1Tables =
+                sql(tEnv, "show tables from %s", dbName1).stream()
+                        .map(row -> row.getField(0).toString())
+                        .collect(Collectors.toList());
+        List<String> actualDB2Tables =
+                sql(tEnv, "show tables from %s", dbName2).stream()
+                        .map(row -> row.getField(0).toString())
+                        .collect(Collectors.toList());
+
+        Assertions.assertThatList(actualDB1Tables).containsExactlyInAnyOrderElementsOf(db1Tables);
+        Assertions.assertThatList(actualDB2Tables).containsExactlyInAnyOrderElementsOf(db2Tables);
+    }
+
+    @Test
+    public void testMigrateWholeCatalogWithIncludedTables() throws Exception {
+        String dbName1 = "hivedb" + StringUtils.randomNumericString(10);
+        String tableName1 = "hivetable1" + StringUtils.randomNumericString(10);
+        String tableName2 = "hivetable2" + StringUtils.randomNumericString(10);
+
+        String dbName2 = "hivedb" + StringUtils.randomNumericString(10);
+        String tableName3 = "hivetable1" + StringUtils.randomNumericString(10);
+        String tableName4 = "hivetable2" + StringUtils.randomNumericString(10);
+
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().build();
+        tEnv.executeSql("CREATE CATALOG HIVE WITH ('type'='hive')");
+        tEnv.useCatalog("HIVE");
+        tEnv.getConfig().setSqlDialect(SqlDialect.HIVE);
+        tEnv.executeSql("CREATE DATABASE " + dbName1);
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING, id2 INT, id3 INT) STORED AS %s",
+                dbName1,
+                tableName1,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName1, tableName1, data(100));
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING) PARTITIONED BY (id2 INT, id3 INT) STORED AS %s",
+                dbName1,
+                tableName2,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName1, tableName2, data(100));
+
+        tEnv.executeSql("CREATE DATABASE " + dbName2);
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING, id2 INT, id3 INT) STORED AS %s",
+                dbName2,
+                tableName3,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName2, tableName3, data(100));
+        sql(
+                tEnv,
+                "CREATE TABLE %s.%s (id STRING) PARTITIONED BY (id2 INT, id3 INT) STORED AS %s",
+                dbName2,
+                tableName4,
+                randomFormat());
+        sql(tEnv, "INSERT INTO TABLE %s.%s VALUES %s", dbName2, tableName4, data(100));
+
+        tEnv.getConfig().setSqlDialect(SqlDialect.DEFAULT);
+        tEnv.executeSql("CREATE CATALOG PAIMON_GE WITH ('type'='paimon-generic')");
+        tEnv.useCatalog("PAIMON_GE");
+        List<String> db1Tables = ImmutableList.of(tableName1);
+        List<String> db2Tables = ImmutableList.of(tableName3);
+
+        sql(tEnv, "CREATE CATALOG PAIMON WITH ('type'='paimon', 'warehouse' = '%s')", warehouse);
+        tEnv.useCatalog("PAIMON");
+
+        createAction(
+                        CloneAction.class,
+                        "clone",
+                        "--catalog_conf",
+                        "metastore=hive",
+                        "--catalog_conf",
+                        "uri=thrift://localhost:" + PORT,
+                        "--target_catalog_conf",
+                        "warehouse=" + warehouse,
+                        "--included_tables",
+                        dbName1 + "." + tableName1 + "," + dbName2 + "." + tableName3)
+                .run();
+
+        List<String> actualDB1Tables =
+                sql(tEnv, "show tables from %s", dbName1).stream()
+                        .map(row -> row.getField(0).toString())
+                        .collect(Collectors.toList());
+        List<String> actualDB2Tables =
+                sql(tEnv, "show tables from %s", dbName2).stream()
+                        .map(row -> row.getField(0).toString())
+                        .collect(Collectors.toList());
+
+        Assertions.assertThatList(actualDB1Tables).containsExactlyInAnyOrderElementsOf(db1Tables);
+        Assertions.assertThatList(actualDB2Tables).containsExactlyInAnyOrderElementsOf(db2Tables);
     }
 
     private String[] ddls(String format) {

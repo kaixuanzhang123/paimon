@@ -70,10 +70,38 @@ clone \
 --target_database test \
 --parallelism 10 \
 --target_catalog_conf warehouse=my_warehouse
+--included_tables <included_tables_spec> \
+--excluded_tables <excluded_tables_spec>
 ```
+"--included_tables" and "--excluded_tables" are optional parameters, which are used to specify the tables that need or don't need to be cloned.
+The format is `<database1>.<table1>,<database2>.<table2>,<database3>.<table3>`.
+"--excluded_tables" has higher priority than "--included_tables" if you specified both.
+
+## Clone Hive Catalog
+
+```bash
+<FLINK_HOME>/flink run ./paimon-flink-action-{{< version >}}.jar \
+clone \
+--catalog_conf metastore=hive \
+--catalog_conf uri=thrift://localhost:9088 \
+--parallelism 10 \
+--target_catalog_conf warehouse=my_warehouse \
+--included_tables <included_tables_spec> \
+--excluded_tables <excluded_tables_spec>
+```
+"--included_tables" and "--excluded_tables" are optional parameters, which are used to specify the tables that need or don't need to be cloned. 
+The format is `<database1>.<table1>,<database2>.<table2>,<database3>.<table3>`.
+"--excluded_tables" has higher priority than "--included_tables" if you specified both.
+
 
 ## Clone Hudi Tables
 
 Clone Hudi needs dependency: [hudi-flink1.18-bundle-0.15.0.jar](https://repo1.maven.org/maven2/org/apache/hudi/hudi-flink1.18-bundle/0.15.0/hudi-flink1.18-bundle-0.15.0.jar)
+
+The execution method is the same as the Hive table mentioned above.
+
+## Clone Iceberg Tables
+
+Clone Iceberg needs dependency: [iceberg-flink-runtime-1.20-1.8.1.jar](https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/1.8.1/iceberg-flink-runtime-1.20-1.8.1.jar)
 
 The execution method is the same as the Hive table mentioned above.

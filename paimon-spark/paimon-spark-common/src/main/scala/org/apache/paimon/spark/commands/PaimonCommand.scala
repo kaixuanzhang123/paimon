@@ -28,7 +28,7 @@ import org.apache.paimon.spark.catalyst.analysis.expressions.ExpressionHelper
 import org.apache.paimon.spark.commands.SparkDataFileMeta.convertToSparkDataFileMeta
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.spark.schema.PaimonMetadataColumn._
-import org.apache.paimon.table.{BucketMode, FileStoreTable, KnownSplitsTable}
+import org.apache.paimon.table.{BucketMode, InnerTable, KnownSplitsTable}
 import org.apache.paimon.table.sink.{CommitMessage, CommitMessageImpl}
 import org.apache.paimon.table.source.DataSplit
 import org.apache.paimon.utils.SerializationUtils
@@ -40,7 +40,6 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Filter => FilterLogicalNode, LogicalPlan, Project}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.sources._
 
 import java.net.URI
 import java.util.Collections
@@ -65,7 +64,6 @@ trait PaimonCommand extends WithFileStoreTable with ExpressionHelper with SQLCon
     } else {
       PaimonSparkWriter(table)
     }
-
   }
 
   /** Gets a relative path against the table path. */
@@ -161,15 +159,22 @@ trait PaimonCommand extends WithFileStoreTable with ExpressionHelper with SQLCon
       relation: DataSourceV2Relation): DataSourceV2Relation = {
     assert(relation.table.isInstanceOf[SparkTable])
     val sparkTable = relation.table.asInstanceOf[SparkTable]
-    assert(sparkTable.table.isInstanceOf[FileStoreTable])
+    assert(sparkTable.table.isInstanceOf[InnerTable])
     val knownSplitsTable =
-      KnownSplitsTable.create(sparkTable.table.asInstanceOf[FileStoreTable], splits.toArray)
-    // We re-plan the relation to skip analyze phase, so we should append all
+      KnownSplitsTable.create(sparkTable.table.asInstanceOf[InnerTable], splits.toArray)
+    val outputNames = relation.outputSet.map(_.name)
+    def isOutputColumn(colName: String) = {
+      val resolve = conf.resolver
+      outputNames.exists(resolve(colName, _))
+    }
+    val appendMetaColumns = sparkTable.metadataColumns
+      .map(_.asInstanceOf[PaimonMetadataColumn].toAttribute)
+      .filter(col => !isOutputColumn(col.name))
+    // We re-plan the relation to skip analyze phase, so we should append needed
     // metadata columns manually and let Spark do column pruning during optimization.
     relation.copy(
       table = relation.table.asInstanceOf[SparkTable].copy(table = knownSplitsTable),
-      output = relation.output ++ sparkTable.metadataColumns.map(
-        _.asInstanceOf[PaimonMetadataColumn].toAttribute)
+      output = relation.output ++ appendMetaColumns
     )
   }
 
