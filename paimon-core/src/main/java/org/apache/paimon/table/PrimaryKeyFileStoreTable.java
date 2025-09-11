@@ -38,6 +38,7 @@ import org.apache.paimon.table.source.KeyValueTableRead;
 import org.apache.paimon.table.source.MergeTreeSplitGenerator;
 import org.apache.paimon.table.source.SplitGenerator;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.RowKindFilter;
 
 import javax.annotation.Nullable;
 
@@ -76,10 +77,12 @@ public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
             KeyValueFieldsExtractor extractor =
                     PrimaryKeyTableUtils.PrimaryKeyFieldsExtractor.EXTRACTOR;
 
+            RowType keyType = new RowType(extractor.keyFields(tableSchema));
+
             MergeFunctionFactory<KeyValue> mfFactory =
                     PrimaryKeyTableUtils.createMergeFunctionFactory(tableSchema, extractor);
             if (options.needLookup()) {
-                mfFactory = LookupMergeFunction.wrap(mfFactory);
+                mfFactory = LookupMergeFunction.wrap(mfFactory, options, keyType, rowType);
             }
 
             lazyStore =
@@ -92,7 +95,7 @@ public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
                             tableSchema.logicalPartitionType(),
                             PrimaryKeyTableUtils.addKeyNamePrefix(
                                     tableSchema.logicalBucketKeyType()),
-                            new RowType(extractor.keyFields(tableSchema)),
+                            keyType,
                             rowType,
                             extractor,
                             mfFactory,
@@ -168,7 +171,7 @@ public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
                                 rowKind,
                                 record.row()),
                 rowKindGenerator(),
-                CoreOptions.fromMap(tableSchema.options()).ignoreDelete());
+                RowKindFilter.of(coreOptions()));
     }
 
     @Override

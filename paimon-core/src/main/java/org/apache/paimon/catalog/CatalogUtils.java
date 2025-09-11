@@ -39,6 +39,7 @@ import org.apache.paimon.table.object.ObjectTable;
 import org.apache.paimon.table.system.AllTableOptionsTable;
 import org.apache.paimon.table.system.CatalogOptionsTable;
 import org.apache.paimon.table.system.SystemTableLoader;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.utils.InternalRowPartitionComputer;
 import org.apache.paimon.utils.Preconditions;
 
@@ -53,7 +54,7 @@ import java.util.function.Function;
 
 import static org.apache.paimon.CoreOptions.AUTO_CREATE;
 import static org.apache.paimon.CoreOptions.PARTITION_DEFAULT_NAME;
-import static org.apache.paimon.CoreOptions.PARTITION_GENERATE_LEGCY_NAME;
+import static org.apache.paimon.CoreOptions.PARTITION_GENERATE_LEGACY_NAME;
 import static org.apache.paimon.CoreOptions.PATH;
 import static org.apache.paimon.CoreOptions.PRIMARY_KEY;
 import static org.apache.paimon.catalog.Catalog.SYSTEM_DATABASE_NAME;
@@ -61,6 +62,7 @@ import static org.apache.paimon.catalog.Catalog.TABLE_DEFAULT_OPTION_PREFIX;
 import static org.apache.paimon.options.OptionsUtils.convertToPropertiesPrefixKey;
 import static org.apache.paimon.table.system.AllTableOptionsTable.ALL_TABLE_OPTIONS;
 import static org.apache.paimon.table.system.CatalogOptionsTable.CATALOG_OPTIONS;
+import static org.apache.paimon.utils.DefaultValueUtils.validateDefaultValue;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** Utils for {@link Catalog}. */
@@ -147,6 +149,9 @@ public class CatalogUtils {
                     "Cannot define %s for format table.",
                     PRIMARY_KEY.key());
         }
+        for (DataField field : schema.fields()) {
+            validateDefaultValue(field.type(), field.defaultValue());
+        }
     }
 
     public static void validateNamePattern(Catalog catalog, String namePattern) {
@@ -165,7 +170,7 @@ public class CatalogUtils {
                         options.get(PARTITION_DEFAULT_NAME),
                         table.rowType().project(table.partitionKeys()),
                         table.partitionKeys().toArray(new String[0]),
-                        options.get(PARTITION_GENERATE_LEGCY_NAME));
+                        options.get(PARTITION_GENERATE_LEGACY_NAME));
         List<PartitionEntry> partitionEntries =
                 table.newReadBuilder().newScan().listPartitionEntries();
         List<Partition> partitions = new ArrayList<>(partitionEntries.size());
@@ -221,9 +226,18 @@ public class CatalogUtils {
             return toIcebergTable(identifier, schema, dataFileIO);
         }
 
+        Identifier tableIdentifier = identifier;
+        if (identifier.isSystemTable()) {
+            tableIdentifier =
+                    new Identifier(
+                            identifier.getDatabaseName(),
+                            identifier.getTableName(),
+                            identifier.getBranchName());
+        }
+
         CatalogEnvironment catalogEnv =
                 new CatalogEnvironment(
-                        identifier,
+                        tableIdentifier,
                         metadata.uuid(),
                         catalog.catalogLoader(),
                         lockFactory,

@@ -105,6 +105,14 @@ public class RoaringBitmap32 {
         return roaringBitmap.intersects(minimum, supremum);
     }
 
+    public RoaringBitmap32 limit(int k) {
+        return new RoaringBitmap32(roaringBitmap.limit(k));
+    }
+
+    public void remove(int position) {
+        roaringBitmap.remove(position);
+    }
+
     public RoaringBitmap32 clone() {
         return new RoaringBitmap32(roaringBitmap.clone());
     }
@@ -165,6 +173,10 @@ public class RoaringBitmap32 {
             roaringBitmap32.add(ele);
         }
         return roaringBitmap32;
+    }
+
+    public static RoaringBitmap32 bitmapOfRange(long min, long max) {
+        return new RoaringBitmap32(RoaringBitmap.bitmapOfRange(min, max));
     }
 
     public static RoaringBitmap32 and(final RoaringBitmap32 x1, final RoaringBitmap32 x2) {

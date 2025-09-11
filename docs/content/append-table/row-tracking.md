@@ -24,15 +24,17 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Use row tracking for Paimon Tables
-
-## What is row tracking
+# Row tracking
 
 Row tracking allows Paimon to track row-level lineage in a Paimon append table. Once enabled on a Paimon table, two more hidden columns will be added to the table schema:
-- `_ROW_ID`: BIGINT, this is a unique identifier for each row in the table. It is used to track the lineage of the row and can be used to identify the row in case of updates or merge into.
+- `_ROW_ID`: BIGINT, this is a unique identifier for each row in the table. It is used to track the lineage of the row and can be used to identify the row in case of update, merge into or delete.
 - `_SEQUENCE_NUMBER`: BIGINT, this is field indicates which `version` of this record is. It actually is the snapshot-id of the snapshot that this row belongs to. It is used to track the lineage of the row version.
 
-## Enable row tracking
+Hidden columns follows the following rules:
+- Whenever we read from one table with row tracking enabled, the `_ROW_ID` and `_SEQUENCE_NUMBER` will be `NOT NULL`.
+- If we append records to row-tracking table in the first time, we don't actually write them to the data file, they are lazy assigned by committer.
+- If one row moved from one file to another file for **any reason**, the `_ROW_ID` column should be copied to the target file. The `_SEQUENCE_NUMBER` field should be set to `NULL` if the record is changed, otherwise, copy it too.
+- Whenever we read from a row-tracking table, we firstly read `_ROW_ID` and `_SEQUENCE_NUMBER` from the data file, then we read the value columns from the data file. If they found `NULL`, we read from `DataFileMeta` to fall back to the lazy assigned values. Anyway, it has no way to be `NULL`.
 
 To enable row-tracking, you must config `row-tracking.enabled` to `true` in the table options when creating an append table.
 Consider an example via Flink SQL:
@@ -46,10 +48,8 @@ WITH ('row-tracking.enabled' = 'true');
 ```
 Notice that:
 - Row tracking is only supported for unaware append tables, not for primary key tables. Which means you can't define `bucket` and `bucket-key` for the table.
-- Only spark support update and merge into operations on row-tracking tables, Flink SQL does not support these operations yet.
+- Only spark support update, merge into and delete operations on row-tracking tables, Flink SQL does not support these operations yet.
 - This function is experimental, this line will be removed after being stable.
-
-## How to use row tracking
 
 After creating a row-tracking table, you can insert data into it as usual. The `_ROW_ID` and `_SEQUENCE_NUMBER` columns will be automatically managed by Paimon.
 ```sql
@@ -92,7 +92,7 @@ You can also merge into the table, suppose you have a source table `s` that cont
 MERGE INTO t USING s
 ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET t.data = s.data
-WHEN NOT MATCHED THEN INSERT *
+WHEN NOT MATCHED THEN INSERT *;
 ```
 
 You will get:
@@ -106,10 +106,18 @@ You will get:
 +---+---------------+-------+----------------+
 ```
 
-## Spec
+You can also delete from the table:
 
-`_ROW_ID` and `_SEQUENCE_NUMBER` fields follows the following rules:
-- Whenever we read from one table with row tracking enabled, the `_ROW_ID` and `_SEQUENCE_NUMBER` will be `NOT NULL`.
-- If we append records to row-tracking table in the first time, we don't actually write them to the data file, they are lazy assigned by committer.
-- If one row moved from one file to another file for **any reason**, the `_ROW_ID` column should be copied to the target file. The `_SEQUENCE_NUMBER` field should be set to `NULL` if the record is changed, otherwise, copy it too.
-- Whenever we read from a row-tracking table, we firstly read `_ROW_ID` and `_SEQUENCE_NUMBER` from the data file, then we read the value columns from the data file. If they found `NULL`, we read from `DataFileMeta` to fall back to the lazy assigned values. Anyway, it has no way to be `NULL`.
+```sql
+DELETE FROM t WHERE id = 11;
+```
+
+You will get:
+```text
++---+---------------+-------+----------------+
+| id|           data|_ROW_ID|_SEQUENCE_NUMBER|
++---+---------------+-------+----------------+
+| 22| new-data-merge|      1|               3|
+| 33|              c|      2|               3|
++---+---------------+-------+----------------+
+```

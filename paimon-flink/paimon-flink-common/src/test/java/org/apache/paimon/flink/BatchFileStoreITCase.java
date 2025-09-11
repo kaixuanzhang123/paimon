@@ -23,7 +23,6 @@ import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.flink.util.AbstractTestBase;
-import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.manifest.IndexManifestEntry;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
@@ -62,6 +61,51 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
     @Override
     protected List<String> ddl() {
         return singletonList("CREATE TABLE IF NOT EXISTS T (a INT, b INT, c INT)");
+    }
+
+    @Test
+    public void testCsvFileFormat() {
+        innerTestTextFileFormat("csv");
+    }
+
+    @Test
+    public void testJsonFileFormat() {
+        innerTestTextFileFormat("json");
+    }
+
+    private void innerTestTextFileFormat(String format) {
+        // TODO zstd dependent on Hadoop 3.x
+        //        sql("CREATE TABLE TEXT_T (a INT, b INT, c INT) WITH ('file.format'='%s')",
+        // format);
+        //        sql("INSERT INTO TEXT_T VALUES (1, 2, 3)");
+        //        assertThat(sql("SELECT * FROM TEXT_T")).containsExactly(Row.of(1, 2, 3));
+        //        List<String> files =
+        //                sql("select file_path from `TEXT_T$files`").stream()
+        //                        .map(r -> r.getField(0).toString())
+        //                        .collect(Collectors.toList());
+        //        assertThat(files).allMatch(file -> file.endsWith(format + ".zst"));
+
+        sql(
+                "CREATE TABLE TEXT_NONE (a INT, b INT, c INT) WITH ('file.format'='%s', 'file.compression'='none')",
+                format);
+        sql("INSERT INTO TEXT_NONE VALUES (1, 2, 3)");
+        assertThat(sql("SELECT a FROM TEXT_NONE")).containsExactly(Row.of(1));
+        List<String> files =
+                sql("select file_path from `TEXT_NONE$files`").stream()
+                        .map(r -> r.getField(0).toString())
+                        .collect(Collectors.toList());
+        assertThat(files).allMatch(file -> file.endsWith(format));
+
+        sql(
+                "CREATE TABLE TEXT_GZIP (a INT, b INT, c INT) WITH ('file.format'='%s', 'file.compression'='gzip')",
+                format);
+        sql("INSERT INTO TEXT_GZIP VALUES (1, 2, 3)");
+        assertThat(sql("SELECT b FROM TEXT_GZIP")).containsExactly(Row.of(2));
+        files =
+                sql("select file_path from `TEXT_GZIP$files`").stream()
+                        .map(r -> r.getField(0).toString())
+                        .collect(Collectors.toList());
+        assertThat(files).allMatch(file -> file.endsWith(format + ".gz"));
     }
 
     @Test
@@ -107,10 +151,9 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
         List<IndexManifestEntry> indexManifestEntries =
                 table.indexManifestFileReader().read(snapshot.indexManifest());
         assertThat(indexManifestEntries.size()).isEqualTo(1);
-        IndexFileMeta indexFileMeta = indexManifestEntries.get(0).indexFile();
         return table.store()
                 .newIndexFileHandler()
-                .readAllDeletionVectors(singletonList(indexFileMeta));
+                .readAllDeletionVectors(indexManifestEntries.get(0));
     }
 
     @Test
@@ -576,7 +619,7 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
     public void testIgnoreDeleteWithRowKindField() {
         sql(
                 "CREATE TABLE ignore_delete (pk INT PRIMARY KEY NOT ENFORCED, v STRING, kind STRING) "
-                        + "WITH ('merge-engine' = 'deduplicate', 'ignore-delete' = 'true', 'bucket' = '1', 'rowkind.field' = 'kind')");
+                        + "WITH ('ignore-delete' = 'true', 'bucket' = '1', 'rowkind.field' = 'kind')");
 
         sql("INSERT INTO ignore_delete VALUES (1, 'A', '+I')");
         assertThat(sql("SELECT * FROM ignore_delete")).containsExactly(Row.of(1, "A", "+I"));
@@ -586,6 +629,22 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
 
         sql("INSERT INTO ignore_delete VALUES (1, 'B', '+I')");
         assertThat(sql("SELECT * FROM ignore_delete")).containsExactly(Row.of(1, "B", "+I"));
+    }
+
+    @Test
+    public void testIgnoreUpdateBeforeWithRowKindField() {
+        sql(
+                "CREATE TABLE ignore_delete (pk INT PRIMARY KEY NOT ENFORCED, v STRING, kind STRING) "
+                        + "WITH ('ignore-update-before' = 'true', 'bucket' = '1', 'rowkind.field' = 'kind')");
+
+        sql("INSERT INTO ignore_delete VALUES (1, 'A', '+I')");
+        assertThat(sql("SELECT * FROM ignore_delete")).containsExactly(Row.of(1, "A", "+I"));
+
+        sql("INSERT INTO ignore_delete VALUES (1, 'A', '-U')");
+        assertThat(sql("SELECT * FROM ignore_delete")).containsExactly(Row.of(1, "A", "+I"));
+
+        sql("INSERT INTO ignore_delete VALUES (1, 'A', '-D')");
+        assertThat(sql("SELECT * FROM ignore_delete")).isEmpty();
     }
 
     @Test
@@ -823,6 +882,18 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
         sql("CREATE TABLE Q (id INT)");
         sql(
                 "INSERT INTO P VALUES ('a', 1, 10), ('a', 2, 20), ('b', 1, 11), ('b', 3, 31), ('c', 1, 12), ('c', 2, 22), ('c', 3, 32)");
+        sql("INSERT INTO Q VALUES (1), (2)");
+        String query =
+                "SELECT Q.id, P.v FROM Q INNER JOIN P /*+ OPTIONS('scan.partitions' = 'pt=b;pt=c') */ ON Q.id = P.id ORDER BY Q.id, P.v";
+        assertThat(sql(query)).containsExactly(Row.of(1, 11), Row.of(1, 12), Row.of(2, 22));
+    }
+
+    @Test
+    public void testScanWithSpecifiedPartitionsWithFieldMapping() {
+        sql("CREATE TABLE P (id INT, v INT, pt STRING) PARTITIONED BY (pt)");
+        sql("CREATE TABLE Q (id INT)");
+        sql(
+                "INSERT INTO P VALUES (1, 10, 'a'), (2, 20, 'a'), (1, 11, 'b'), (3, 31, 'b'), (1, 12, 'c'), (2, 22, 'c'), (3, 32, 'c')");
         sql("INSERT INTO Q VALUES (1), (2)");
         String query =
                 "SELECT Q.id, P.v FROM Q INNER JOIN P /*+ OPTIONS('scan.partitions' = 'pt=b;pt=c') */ ON Q.id = P.id ORDER BY Q.id, P.v";

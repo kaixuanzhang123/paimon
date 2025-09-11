@@ -21,7 +21,7 @@ package org.apache.paimon.table.sink;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.consumer.ConsumerManager;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.index.IndexFileMeta;
+import org.apache.paimon.index.IndexPathFactory;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.manifest.ManifestCommittable;
@@ -33,9 +33,10 @@ import org.apache.paimon.stats.Statistics;
 import org.apache.paimon.tag.TagAutoCreation;
 import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.tag.TagTimeExpire;
+import org.apache.paimon.utils.CompactedChangelogPathResolver;
 import org.apache.paimon.utils.DataFilePathFactories;
 import org.apache.paimon.utils.ExecutorThreadFactory;
-import org.apache.paimon.utils.PathFactory;
+import org.apache.paimon.utils.IndexFilePathFactories;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
 import org.apache.paimon.shade.guava30.com.google.common.util.concurrent.MoreExecutors;
@@ -278,27 +279,36 @@ public class TableCommitImpl implements InnerTableCommit {
     private void checkFilesExistence(List<ManifestCommittable> committables) {
         List<Path> files = new ArrayList<>();
         DataFilePathFactories factories = new DataFilePathFactories(commit.pathFactory());
-        PathFactory indexFileFactory = commit.pathFactory().indexFileFactory();
+        IndexFilePathFactories indexFactories = new IndexFilePathFactories(commit.pathFactory());
         for (ManifestCommittable committable : committables) {
             for (CommitMessage message : committable.fileCommittables()) {
                 CommitMessageImpl msg = (CommitMessageImpl) message;
                 DataFilePathFactory pathFactory =
                         factories.get(message.partition(), message.bucket());
+                IndexPathFactory indexFileFactory =
+                        indexFactories.get(message.partition(), message.bucket());
                 Consumer<DataFileMeta> collector = f -> files.addAll(f.collectFiles(pathFactory));
                 msg.newFilesIncrement().newFiles().forEach(collector);
                 msg.newFilesIncrement().changelogFiles().forEach(collector);
                 msg.compactIncrement().compactBefore().forEach(collector);
                 msg.compactIncrement().compactAfter().forEach(collector);
                 msg.indexIncrement().newIndexFiles().stream()
-                        .map(IndexFileMeta::fileName)
                         .map(indexFileFactory::toPath)
                         .forEach(files::add);
                 msg.indexIncrement().deletedIndexFiles().stream()
-                        .map(IndexFileMeta::fileName)
                         .map(indexFileFactory::toPath)
                         .forEach(files::add);
             }
         }
+
+        // Resolve compacted changelog files to their real file paths
+        List<Path> resolvedFiles = new ArrayList<>();
+        for (Path file : files) {
+            resolvedFiles.add(CompactedChangelogPathResolver.resolveCompactedChangelogPath(file));
+        }
+        // Deduplicate paths as multiple compacted changelog references may resolve to the same
+        // physical file
+        resolvedFiles = resolvedFiles.stream().distinct().collect(Collectors.toList());
 
         Predicate<Path> nonExists =
                 p -> {
@@ -314,7 +324,7 @@ public class TableCommitImpl implements InnerTableCommit {
                         randomlyExecuteSequentialReturn(
                                 getExecutorService(null),
                                 f -> nonExists.test(f) ? singletonList(f) : emptyList(),
-                                files));
+                                resolvedFiles));
 
         if (!nonExistFiles.isEmpty()) {
             String message =

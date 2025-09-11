@@ -22,6 +22,7 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.operation.MergeFileSplitRead;
 import org.apache.paimon.operation.SplitRead;
 import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.source.splitread.SplitReadConfig;
@@ -45,6 +46,8 @@ public final class AppendTableRead extends AbstractDataTableRead {
 
     @Nullable private RowType readType = null;
     private Predicate predicate = null;
+    private TopN topN = null;
+    private Integer limit = null;
 
     public AppendTableRead(
             List<Function<SplitReadConfig, SplitReadProvider>> providerFactories,
@@ -71,6 +74,8 @@ public final class AppendTableRead extends AbstractDataTableRead {
             read = read.withReadType(readType);
         }
         read.withFilter(predicate);
+        read.withTopN(topN);
+        read.withLimit(limit);
     }
 
     @Override
@@ -83,6 +88,20 @@ public final class AppendTableRead extends AbstractDataTableRead {
     protected InnerTableRead innerWithFilter(Predicate predicate) {
         initialized().forEach(r -> r.withFilter(predicate));
         this.predicate = predicate;
+        return this;
+    }
+
+    @Override
+    public InnerTableRead withTopN(TopN topN) {
+        initialized().forEach(r -> r.withTopN(topN));
+        this.topN = topN;
+        return this;
+    }
+
+    @Override
+    public InnerTableRead withLimit(int limit) {
+        initialized().forEach(r -> r.withLimit(limit));
+        this.limit = limit;
         return this;
     }
 

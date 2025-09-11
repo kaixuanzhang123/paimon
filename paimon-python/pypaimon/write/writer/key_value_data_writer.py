@@ -22,26 +22,14 @@ import pyarrow.compute as pc
 from pypaimon.write.writer.data_writer import DataWriter
 
 
-class SequenceGenerator:
-    def __init__(self, start: int = 0):
-        self.current = start
-
-    def next(self) -> int:
-        self.current += 1
-        return self.current
-
-
-sequence_generator = SequenceGenerator()
-
-
 class KeyValueDataWriter(DataWriter):
     """Data writer for primary key tables with system fields and sorting."""
 
-    def _process_data(self, data: pa.RecordBatch) -> pa.RecordBatch:
+    def _process_data(self, data: pa.RecordBatch) -> pa.Table:
         enhanced_data = self._add_system_fields(data)
-        return self._sort_by_primary_key(enhanced_data)
+        return pa.Table.from_batches([self._sort_by_primary_key(enhanced_data)])
 
-    def _merge_data(self, existing_data: pa.RecordBatch, new_data: pa.RecordBatch) -> pa.RecordBatch:
+    def _merge_data(self, existing_data: pa.Table, new_data: pa.Table) -> pa.Table:
         combined = pa.concat_tables([existing_data, new_data])
         return self._sort_by_primary_key(combined)
 
@@ -55,11 +43,11 @@ class KeyValueDataWriter(DataWriter):
                 key_column = data.column(pk_key)
                 enhanced_table = enhanced_table.add_column(0, f'_KEY_{pk_key}', key_column)
 
-        sequence_column = pa.array([sequence_generator.next() for _ in range(num_rows)], type=pa.int64())
+        sequence_column = pa.array([self.sequence_generator.next() for _ in range(num_rows)], type=pa.int64())
         enhanced_table = enhanced_table.add_column(len(self.trimmed_primary_key), '_SEQUENCE_NUMBER', sequence_column)
 
         # TODO: support real row kind here
-        value_kind_column = pa.repeat(0, num_rows)
+        value_kind_column = pa.array([0] * num_rows, type=pa.int32())
         enhanced_table = enhanced_table.add_column(len(self.trimmed_primary_key) + 1, '_VALUE_KIND',
                                                    value_kind_column)
 

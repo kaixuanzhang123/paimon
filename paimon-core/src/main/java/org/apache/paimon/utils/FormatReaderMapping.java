@@ -23,6 +23,8 @@ import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.partition.PartitionUtils;
 import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.SortValue;
+import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.schema.IndexCastMapping;
 import org.apache.paimon.schema.SchemaEvolutionUtil;
 import org.apache.paimon.schema.TableSchema;
@@ -40,6 +42,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 
 import static org.apache.paimon.predicate.PredicateBuilder.excludePredicateWithFields;
@@ -60,6 +63,8 @@ public class FormatReaderMapping {
     private final TableSchema dataSchema;
     private final List<Predicate> dataFilters;
     private final Map<String, Integer> systemFields;
+    @Nullable private final TopN topN;
+    @Nullable private final Integer limit;
 
     public FormatReaderMapping(
             @Nullable int[] indexMapping,
@@ -69,7 +74,9 @@ public class FormatReaderMapping {
             FormatReaderFactory readerFactory,
             TableSchema dataSchema,
             List<Predicate> dataFilters,
-            Map<String, Integer> systemFields) {
+            Map<String, Integer> systemFields,
+            @Nullable TopN topN,
+            @Nullable Integer limit) {
         this.indexMapping = combine(indexMapping, trimmedKeyMapping);
         this.castMapping = castMapping;
         this.readerFactory = readerFactory;
@@ -77,6 +84,8 @@ public class FormatReaderMapping {
         this.dataSchema = dataSchema;
         this.dataFilters = dataFilters;
         this.systemFields = systemFields;
+        this.topN = topN;
+        this.limit = limit;
     }
 
     private int[] combine(@Nullable int[] indexMapping, @Nullable int[] trimmedKeyMapping) {
@@ -130,6 +139,16 @@ public class FormatReaderMapping {
         return dataFilters;
     }
 
+    @Nullable
+    public TopN getTopN() {
+        return topN;
+    }
+
+    @Nullable
+    public Integer getLimit() {
+        return limit;
+    }
+
     /** Builder for {@link FormatReaderMapping}. */
     public static class Builder {
 
@@ -137,16 +156,22 @@ public class FormatReaderMapping {
         private final List<DataField> readFields;
         private final Function<TableSchema, List<DataField>> fieldsExtractor;
         @Nullable private final List<Predicate> filters;
+        @Nullable private final TopN topN;
+        @Nullable private final Integer limit;
 
         public Builder(
                 FileFormatDiscover formatDiscover,
                 List<DataField> readFields,
                 Function<TableSchema, List<DataField>> fieldsExtractor,
-                @Nullable List<Predicate> filters) {
+                @Nullable List<Predicate> filters,
+                @Nullable TopN topN,
+                @Nullable Integer limit) {
             this.formatDiscover = formatDiscover;
             this.readFields = readFields;
             this.fieldsExtractor = fieldsExtractor;
             this.filters = filters;
+            this.topN = topN;
+            this.limit = limit;
         }
 
         /**
@@ -205,10 +230,33 @@ public class FormatReaderMapping {
                     partitionMapping,
                     formatDiscover
                             .discover(formatIdentifier)
-                            .createReaderFactory(actualReadRowType, readFilters),
+                            .createReaderFactory(
+                                    new RowType(allDataFieldsInFile),
+                                    actualReadRowType,
+                                    readFilters),
                     dataSchema,
                     readFilters,
-                    systemFields);
+                    systemFields,
+                    evolutionTopN(tableSchema, dataSchema),
+                    limit);
+        }
+
+        @Nullable
+        private TopN evolutionTopN(TableSchema tableSchema, TableSchema dataSchema) {
+            TopN pushTopN = topN;
+            if (pushTopN != null) {
+                Map<String, DataField> tableFields = tableSchema.nameToFieldMap();
+                Map<Integer, DataField> dataFields = dataSchema.idToFieldMap();
+                for (SortValue value : pushTopN.orders()) {
+                    DataField tableField = tableFields.get(value.field().name());
+                    DataField dataField = dataFields.get(tableField.id());
+                    if (!Objects.equals(tableField, dataField)) {
+                        pushTopN = null;
+                        break;
+                    }
+                }
+            }
+            return pushTopN;
         }
 
         public FormatReaderMapping build(

@@ -19,124 +19,39 @@ limitations under the License.
 import json
 import logging
 import time
-import traceback
 import urllib.parse
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Type, TypeVar
+from typing import Callable, Dict, Optional, Type, TypeVar
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 
-from pypaimon.common.rest_json import JSON
-
-from .api_response import ErrorResponse
-from .typedef import RESTAuthParameter
+from pypaimon.api.api_response import ErrorResponse
+from pypaimon.api.rest_exception import (AlreadyExistsException,
+                                         BadRequestException,
+                                         ForbiddenException,
+                                         NoSuchResourceException,
+                                         NotAuthorizedException,
+                                         NotImplementedException,
+                                         RESTException,
+                                         ServiceFailureException,
+                                         ServiceUnavailableException)
+from pypaimon.api.typedef import RESTAuthParameter
+from pypaimon.common.json_util import JSON
 
 T = TypeVar('T', bound='RESTResponse')
 
 
 class RESTRequest(ABC):
-    pass
-
-
-class RESTException(Exception):
-    def __init__(self, message: str = None, *args: Any, cause: Optional[Exception] = None):
-        if message and args:
-            try:
-                formatted_message = message % args
-            except (TypeError, ValueError):
-                formatted_message = f"{message} {' '.join(str(arg) for arg in args)}"
-        else:
-            formatted_message = message or "REST API error occurred"
-
-        super().__init__(formatted_message)
-        self.__cause__ = cause
-
-    def get_cause(self) -> Optional[Exception]:
-        return self.__cause__
-
-    def get_message(self) -> str:
-        return str(self)
-
-    def print_stack_trace(self) -> None:
-        traceback.print_exception(type(self), self, self.__traceback__)
-
-    def get_stack_trace(self) -> str:
-        return ''.join(traceback.format_exception(type(self), self, self.__traceback__))
-
-    def __repr__(self) -> str:
-        if self.__cause__:
-            return f"{self.__class__.__name__}('{self}', caused by {type(self.__cause__).__name__}: {self.__cause__})"
-        return f"{self.__class__.__name__}('{self}')"
-
-
-class BadRequestException(RESTException):
-
-    def __init__(self, message: str = None, *args: Any):
-        super().__init__(message, *args)
-
-
-class NotAuthorizedException(RESTException):
-    """Exception for not authorized (401)"""
-
-    def __init__(self, message: str, *args: Any):
-        super().__init__(message, *args)
-
-
-class ForbiddenException(RESTException):
-    """Exception for forbidden access (403)"""
-
-    def __init__(self, message: str, *args: Any):
-        super().__init__(message, *args)
-
-
-class NoSuchResourceException(RESTException):
-    """Exception for resource not found (404)"""
-
-    def __init__(self, resource_type: Optional[str], resource_name: Optional[str],
-                 message: str, *args: Any):
-        self.resource_type = resource_type
-        self.resource_name = resource_name
-        super().__init__(message, *args)
-
-
-class AlreadyExistsException(RESTException):
-    """Exception for resource already exists (409)"""
-
-    def __init__(self, resource_type: Optional[str], resource_name: Optional[str],
-                 message: str, *args: Any):
-        self.resource_type = resource_type
-        self.resource_name = resource_name
-        super().__init__(message, *args)
-
-
-class ServiceFailureException(RESTException):
-    """Exception for service failure (500)"""
-
-    def __init__(self, message: str, *args: Any):
-        super().__init__(message, *args)
-
-
-class NotImplementedException(RESTException):
-    """Exception for not implemented (501)"""
-
-    def __init__(self, message: str, *args: Any):
-        super().__init__(message, *args)
-
-
-class ServiceUnavailableException(RESTException):
-    """Exception for service unavailable (503)"""
-
-    def __init__(self, message: str, *args: Any):
-        super().__init__(message, *args)
+    """RESTRequest"""
 
 
 class ErrorHandler(ABC):
 
     @abstractmethod
     def accept(self, error: ErrorResponse, request_id: str) -> None:
-        pass
+        """accept"""
 
 
 # DefaultErrorHandler implementation
@@ -181,7 +96,7 @@ class DefaultErrorHandler(ErrorHandler):
             message = error.message
         else:
             # If we have a requestId, append it to the message
-            message = f"{error.message} requestId:{request_id}"
+            message = "{} requestId:{}".format(error.message, request_id)
 
         # Handle different error codes
         if code == 400:
@@ -302,7 +217,7 @@ def _normalize_uri(uri: str) -> str:
         server_uri = server_uri[:-1]
 
     if not server_uri.startswith("http://") and not server_uri.startswith("https://"):
-        server_uri = f"http://{server_uri}"
+        server_uri = "http://{}".format(server_uri)
 
     return server_uri
 
@@ -429,7 +344,7 @@ class HttpClient(RESTClient):
 
         if query_params:
             query_string = urllib.parse.urlencode(query_params)
-            full_path = f"{full_path}?{query_string}"
+            full_path = "{}?{}".format(full_path, query_string)
 
         return full_path
 
@@ -441,14 +356,14 @@ class HttpClient(RESTClient):
                          headers: Optional[Dict[str, str]] = None,
                          response_type: Optional[Type[T]] = None) -> T:
         try:
-            start_time = time.time_ns()
+            start_time = int(time.time() * 1_000_000_000)
             response = self.session.request(
                 method=method,
                 url=url,
                 data=data.encode('utf-8') if data else None,
                 headers=headers
             )
-            duration_ms = (time.time_ns() - start_time) // 1_000_000
+            duration_ms = (int(time.time() * 1_000_000_000) - start_time) // 1_000_000
             response_request_id = response.headers.get(self.REQUEST_ID_KEY, self.DEFAULT_REQUEST_ID)
 
             self.logger.info(

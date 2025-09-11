@@ -15,23 +15,25 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 ################################################################################
-
+import pyarrow as pa
+import pyarrow.compute as pc
 import uuid
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
-
-import pyarrow as pa
+from typing import Dict, List, Optional, Tuple
 
 from pypaimon.common.core_options import CoreOptions
 from pypaimon.manifest.schema.data_file_meta import DataFileMeta
-from pypaimon.table.row.binary_row import BinaryRow
+from pypaimon.manifest.schema.simple_stats import SimpleStats
+from pypaimon.table.bucket_mode import BucketMode
+from pypaimon.table.row.generic_row import GenericRow
 
 
 class DataWriter(ABC):
     """Base class for data writers that handle PyArrow tables directly."""
 
-    def __init__(self, table, partition: Tuple, bucket: int):
+    def __init__(self, table, partition: Tuple, bucket: int, max_seq_number: int):
         from pypaimon.table.file_store_table import FileStoreTable
 
         self.table: FileStoreTable = table
@@ -44,10 +46,14 @@ class DataWriter(ABC):
 
         options = self.table.options
         self.target_file_size = 256 * 1024 * 1024
-        self.file_format = options.get(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_PARQUET)
+        self.file_format = options.get(CoreOptions.FILE_FORMAT,
+                                       CoreOptions.FILE_FORMAT_PARQUET
+                                       if self.bucket != BucketMode.POSTPONE_BUCKET.value
+                                       else CoreOptions.FILE_FORMAT_AVRO)
         self.compression = options.get(CoreOptions.FILE_COMPRESSION, "zstd")
+        self.sequence_generator = SequenceGenerator(max_seq_number)
 
-        self.pending_data: Optional[pa.RecordBatch] = None
+        self.pending_data: Optional[pa.Table] = None
         self.committed_files: List[DataFileMeta] = []
 
     def write(self, data: pa.RecordBatch):
@@ -83,9 +89,9 @@ class DataWriter(ABC):
         if self.pending_data is None:
             return
 
-        current_size = self.pending_data.get_total_buffer_size()
+        current_size = self.pending_data.nbytes
         if current_size > self.target_file_size:
-            split_row = _find_optimal_split_point(self.pending_data, self.target_file_size)
+            split_row = self._find_optimal_split_point(self.pending_data, self.target_file_size)
             if split_row > 0:
                 data_to_write = self.pending_data.slice(0, split_row)
                 remaining_data = self.pending_data.slice(split_row)
@@ -94,10 +100,10 @@ class DataWriter(ABC):
                 self.pending_data = remaining_data
                 self._check_and_roll_if_needed()
 
-    def _write_data_to_file(self, data: pa.RecordBatch):
+    def _write_data_to_file(self, data: pa.Table):
         if data.num_rows == 0:
             return
-        file_name = f"data-{uuid.uuid4()}.{self.file_format}"
+        file_name = f"data-{uuid.uuid4()}-0.{self.file_format}"
         file_path = self._generate_file_path(file_name)
         if self.file_format == CoreOptions.FILE_FORMAT_PARQUET:
             self.file_io.write_parquet(file_path, data, compression=self.compression)
@@ -108,24 +114,58 @@ class DataWriter(ABC):
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
-        key_columns_batch = data.select(self.trimmed_primary_key)
+        # min key & max key
+
+        selected_table = data.select(self.trimmed_primary_key)
+        key_columns_batch = selected_table.to_batches()[0]
         min_key_row_batch = key_columns_batch.slice(0, 1)
-        min_key_data = [col.to_pylist()[0] for col in min_key_row_batch.columns]
         max_key_row_batch = key_columns_batch.slice(key_columns_batch.num_rows - 1, 1)
-        max_key_data = [col.to_pylist()[0] for col in max_key_row_batch.columns]
+        min_key = [col.to_pylist()[0] for col in min_key_row_batch.columns]
+        max_key = [col.to_pylist()[0] for col in max_key_row_batch.columns]
+
+        # key stats & value stats
+        column_stats = {
+            field.name: self._get_column_stats(data, field.name)
+            for field in self.table.table_schema.fields
+        }
+        all_fields = self.table.table_schema.fields
+        min_value_stats = [column_stats[field.name]['min_values'] for field in all_fields]
+        max_value_stats = [column_stats[field.name]['max_values'] for field in all_fields]
+        value_null_counts = [column_stats[field.name]['null_counts'] for field in all_fields]
+        key_fields = self.trimmed_primary_key_fields
+        min_key_stats = [column_stats[field.name]['min_values'] for field in key_fields]
+        max_key_stats = [column_stats[field.name]['max_values'] for field in key_fields]
+        key_null_counts = [column_stats[field.name]['null_counts'] for field in key_fields]
+        if not all(count == 0 for count in key_null_counts):
+            raise RuntimeError("Primary key should not be null")
+
+        min_seq = self.sequence_generator.start
+        max_seq = self.sequence_generator.current
+        self.sequence_generator.start = self.sequence_generator.current
         self.committed_files.append(DataFileMeta(
             file_name=file_name,
             file_size=self.file_io.get_file_size(file_path),
             row_count=data.num_rows,
-            min_key=BinaryRow(min_key_data, self.trimmed_primary_key_fields),
-            max_key=BinaryRow(max_key_data, self.trimmed_primary_key_fields),
-            key_stats=None,  # TODO
-            value_stats=None,
-            min_sequence_number=0,
-            max_sequence_number=0,
-            schema_id=0,
+            min_key=GenericRow(min_key, self.trimmed_primary_key_fields),
+            max_key=GenericRow(max_key, self.trimmed_primary_key_fields),
+            key_stats=SimpleStats(
+                GenericRow(min_key_stats, self.trimmed_primary_key_fields),
+                GenericRow(max_key_stats, self.trimmed_primary_key_fields),
+                key_null_counts,
+            ),
+            value_stats=SimpleStats(
+                GenericRow(min_value_stats, self.table.table_schema.fields),
+                GenericRow(max_value_stats, self.table.table_schema.fields),
+                value_null_counts,
+            ),
+            min_sequence_number=min_seq,
+            max_sequence_number=max_seq,
+            schema_id=self.table.table_schema.id,
             level=0,
-            extra_files=None,
+            extra_files=[],
+            creation_time=datetime.now(),
+            delete_row_count=0,
+            value_stats_cols=None,  # None means all columns have statistics
             file_path=str(file_path),
         ))
 
@@ -134,28 +174,60 @@ class DataWriter(ABC):
 
         for i, field_name in enumerate(self.table.partition_keys):
             path_builder = path_builder / (field_name + "=" + str(self.partition[i]))
-        path_builder = path_builder / ("bucket-" + str(self.bucket)) / file_name
+        if self.bucket == BucketMode.POSTPONE_BUCKET.value:
+            bucket_name = "postpone"
+        else:
+            bucket_name = str(self.bucket)
+        path_builder = path_builder / ("bucket-" + bucket_name) / file_name
 
         return path_builder
 
+    @staticmethod
+    def _find_optimal_split_point(data: pa.RecordBatch, target_size: int) -> int:
+        total_rows = data.num_rows
+        if total_rows <= 1:
+            return 0
 
-def _find_optimal_split_point(data: pa.RecordBatch, target_size: int) -> int:
-    total_rows = data.num_rows
-    if total_rows <= 1:
-        return 0
+        left, right = 1, total_rows
+        best_split = 0
 
-    left, right = 1, total_rows
-    best_split = 0
+        while left <= right:
+            mid = (left + right) // 2
+            slice_data = data.slice(0, mid)
+            slice_size = slice_data.nbytes
 
-    while left <= right:
-        mid = (left + right) // 2
-        slice_data = data.slice(0, mid)
-        slice_size = slice_data.get_total_buffer_size()
+            if slice_size <= target_size:
+                best_split = mid
+                left = mid + 1
+            else:
+                right = mid - 1
 
-        if slice_size <= target_size:
-            best_split = mid
-            left = mid + 1
-        else:
-            right = mid - 1
+        return best_split
 
-    return best_split
+    @staticmethod
+    def _get_column_stats(record_batch: pa.RecordBatch, column_name: str) -> Dict:
+        column_array = record_batch.column(column_name)
+        if column_array.null_count == len(column_array):
+            return {
+                "min_values": None,
+                "max_values": None,
+                "null_counts": column_array.null_count,
+            }
+        min_values = pc.min(column_array).as_py()
+        max_values = pc.max(column_array).as_py()
+        null_counts = column_array.null_count
+        return {
+            "min_values": min_values,
+            "max_values": max_values,
+            "null_counts": null_counts,
+        }
+
+
+class SequenceGenerator:
+    def __init__(self, start: int = 0):
+        self.start = start
+        self.current = start
+
+    def next(self) -> int:
+        self.current += 1
+        return self.current

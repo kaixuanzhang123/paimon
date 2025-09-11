@@ -20,10 +20,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Generic, List, Optional
 
-from pypaimon.common.rest_json import json_field
+from pypaimon.common.json_util import T, json_field
 from pypaimon.schema.schema import Schema
-
-from .typedef import T
 
 
 @dataclass
@@ -33,7 +31,7 @@ class PagedList(Generic[T]):
 
 
 class RESTResponse(ABC):
-    pass
+    """RESTResponse"""
 
 
 @dataclass
@@ -85,7 +83,7 @@ class AuditRESTResponse(RESTResponse):
     def get_updated_by(self) -> Optional[str]:
         return self.updated_by
 
-    def put_audit_options_to(self, options: dict[str, str]) -> None:
+    def put_audit_options_to(self, options: Dict[str, str]) -> None:
         """Puts audit-related options into the provided dictionary."""
         options[self.FIELD_OWNER] = self.get_owner()
         options[self.FIELD_CREATED_BY] = str(self.get_created_by())
@@ -99,11 +97,11 @@ class PagedResponse(RESTResponse, Generic[T]):
 
     @abstractmethod
     def data(self) -> List[T]:
-        pass
+        """data"""
 
     @abstractmethod
     def get_next_page_token(self) -> str:
-        pass
+        """get_next_page_token"""
 
 
 @dataclass
@@ -206,7 +204,7 @@ class GetDatabaseResponse(AuditRESTResponse):
     name: Optional[str] = json_field(FIELD_NAME, default=None)
     location: Optional[str] = json_field(FIELD_LOCATION, default=None)
     options: Optional[Dict[str, str]] = json_field(
-        FIELD_OPTIONS, default_factory=dict)
+        FIELD_OPTIONS, default_factory=Dict)
 
     def __init__(
             self,
@@ -258,3 +256,13 @@ class GetTableTokenResponse(RESTResponse):
 
     token: Dict[str, str] = json_field(FIELD_TOKEN, default=None)
     expires_at_millis: Optional[int] = json_field(FIELD_EXPIRES_AT_MILLIS, default=None)
+
+
+@dataclass
+class CommitTableResponse(RESTResponse):
+    FIELD_SUCCESS = "success"
+
+    success: bool = json_field(FIELD_SUCCESS, default=False)
+
+    def is_success(self) -> bool:
+        return self.success

@@ -28,11 +28,16 @@ import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.SortValue;
+import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.utils.RoaringBitmap32;
 
 import java.util.List;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+
+import static org.apache.paimon.predicate.SortValue.SortDirection.ASCENDING;
 
 /** Implementation of range-bitmap file index. */
 public class RangeBitmapFileIndex implements FileIndexer {
@@ -146,6 +151,25 @@ public class RangeBitmapFileIndex implements FileIndexer {
         @Override
         public FileIndexResult visitGreaterOrEqual(FieldRef fieldRef, Object literal) {
             return new BitmapIndexResult(() -> bitmap.gte(converter.apply(literal)));
+        }
+
+        @Override
+        public FileIndexResult visitTopN(TopN topN, FileIndexResult result) {
+            RoaringBitmap32 foundSet =
+                    result instanceof BitmapIndexResult ? ((BitmapIndexResult) result).get() : null;
+
+            int limit = topN.limit();
+            List<SortValue> orders = topN.orders();
+            SortValue sort = orders.get(0);
+            SortValue.NullOrdering nullOrdering = sort.nullOrdering();
+            boolean strict = orders.size() == 1;
+            if (ASCENDING.equals(sort.direction())) {
+                return new BitmapIndexResult(
+                        () -> bitmap.bottomK(limit, nullOrdering, foundSet, strict));
+            } else {
+                return new BitmapIndexResult(
+                        () -> bitmap.topK(limit, nullOrdering, foundSet, strict));
+            }
         }
     }
 }

@@ -17,23 +17,32 @@
 ################################################################################
 
 from dataclasses import dataclass
+from typing import List, Optional
 
-from pypaimon.table.row.binary_row import BinaryRow
+from pypaimon.table.row.generic_row import GenericRow
 
 
 @dataclass
 class SimpleStats:
-    min_value: BinaryRow
-    max_value: BinaryRow
-    null_count: int
+    min_values: GenericRow
+    max_values: GenericRow
+    null_counts: Optional[List[int]]
 
 
 SIMPLE_STATS_SCHEMA = {
     "type": "record",
     "name": "SimpleStats",
     "fields": [
-        {"name": "_MIN_VALUES", "type": ["null", "bytes"], "default": None},
-        {"name": "_MAX_VALUES", "type": ["null", "bytes"], "default": None},
-        {"name": "_NULL_COUNTS", "type": ["null", "long"], "default": None},
+        {"name": "_MIN_VALUES", "type": "bytes"},
+        {"name": "_MAX_VALUES", "type": "bytes"},
+        {"name": "_NULL_COUNTS",
+         "type": [
+             "null",
+             {
+                 "type": "array",
+                 "items": ["null", "long"]
+             }
+         ],
+         "default": None},
     ]
 }

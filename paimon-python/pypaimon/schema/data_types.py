@@ -77,9 +77,13 @@ class AtomicType(DataType):
             return self.type + " NOT NULL"
         return self.type
 
+    @classmethod
+    def from_dict(cls, data: str) -> "AtomicType":
+        return DataTypeParser.parse_data_type(data)
+
     def __str__(self) -> str:
         null_suffix = "" if self.nullable else " NOT NULL"
-        return f"{self.type}{null_suffix}"
+        return "{}{}".format(self.type, null_suffix)
 
 
 @dataclass
@@ -97,9 +101,13 @@ class ArrayType(DataType):
             "nullable": self.nullable
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ArrayType":
+        return DataTypeParser.parse_data_type(data)
+
     def __str__(self) -> str:
         null_suffix = "" if self.nullable else " NOT NULL"
-        return f"ARRAY<{self.element}>{null_suffix}"
+        return "ARRAY<{}>{}".format(self.element, null_suffix)
 
 
 @dataclass
@@ -112,14 +120,18 @@ class MultisetType(DataType):
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "type": f"MULTISET{'<' + str(self.element) + '>' if self.element else ''}",
+            "type": "MULTISET{}".format('<' + str(self.element) + '>' if self.element else ''),
             "element": self.element.to_dict() if self.element else None,
             "nullable": self.nullable,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MultisetType":
+        return DataTypeParser.parse_data_type(data)
+
     def __str__(self) -> str:
         null_suffix = "" if self.nullable else " NOT NULL"
-        return f"MULTISET<{self.element}>{null_suffix}"
+        return "MULTISET<{}>{}".format(self.element, null_suffix)
 
 
 @dataclass
@@ -138,15 +150,19 @@ class MapType(DataType):
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "type": f"MAP<{self.key}, {self.value}>",
+            "type": "MAP<{}, {}>".format(self.key, self.value),
             "key": self.key.to_dict() if self.key else None,
             "value": self.value.to_dict() if self.value else None,
             "nullable": self.nullable,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MapType":
+        return DataTypeParser.parse_data_type(data)
+
     def __str__(self) -> str:
         null_suffix = "" if self.nullable else " NOT NULL"
-        return f"MAP<{self.key}, {self.value}>{null_suffix}"
+        return "MAP<{}, {}>{}".format(self.key, self.value, null_suffix)
 
 
 @dataclass
@@ -212,10 +228,14 @@ class RowType(DataType):
             "nullable": self.nullable,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RowType":
+        return DataTypeParser.parse_data_type(data)
+
     def __str__(self) -> str:
-        field_strs = [f"{field.name}: {field.type}" for field in self.fields]
+        field_strs = ["{}: {}".format(field.name, field.type) for field in self.fields]
         null_suffix = "" if self.nullable else " NOT NULL"
-        return f"ROW<{', '.join(field_strs)}>{null_suffix}"
+        return "ROW<{}>{}".format(', '.join(field_strs), null_suffix)
 
 
 class Keyword(Enum):
@@ -259,16 +279,19 @@ class DataTypeParser:
 
         if "(" in type_upper:
             base_type = type_upper.split("(")[0]
+        elif " " in type_upper:
+            base_type = type_upper.split(" ")[0]
+            type_upper = base_type
         else:
             base_type = type_upper
 
         try:
             Keyword(base_type)
             return AtomicType(
-                type_string, DataTypeParser.parse_nullability(type_string)
+                type_upper, DataTypeParser.parse_nullability(type_string)
             )
         except ValueError:
-            raise Exception(f"Unknown type: {base_type}")
+            raise Exception("Unknown type: {}".format(base_type))
 
     @staticmethod
     def parse_data_type(
@@ -280,7 +303,7 @@ class DataTypeParser:
 
         if isinstance(json_data, dict):
             if "type" not in json_data:
-                raise ValueError(f"Missing 'type' field in JSON: {json_data}")
+                raise ValueError("Missing 'type' field in JSON: {}".format(json_data))
 
             type_string = json_data["type"]
 
@@ -319,17 +342,13 @@ class DataTypeParser:
             else:
                 return DataTypeParser.parse_atomic_type_sql_string(type_string)
 
-        raise ValueError(f"Cannot parse data type: {json_data}")
+        raise ValueError("Cannot parse data type: {}".format(json_data))
 
     @staticmethod
     def parse_data_field(
             json_data: Dict[str, Any], field_id: Optional[AtomicInteger] = None
     ) -> DataField:
-
-        if (
-                DataField.FIELD_ID in json_data
-                and json_data[DataField.FIELD_ID] is not None
-        ):
+        if DataField.FIELD_ID in json_data and json_data[DataField.FIELD_ID] is not None:
             if field_id is not None and field_id.get() != -1:
                 raise ValueError("Partial field id is not allowed.")
             field_id_value = int(json_data["id"])
@@ -398,7 +417,7 @@ class PyarrowFieldParser:
                 else:
                     return pyarrow.decimal128(38, 18)
             else:
-                raise ValueError(f"Unsupported data type: {type_name}")
+                raise ValueError("Unsupported data type: {}".format(type_name))
         elif isinstance(data_type, ArrayType):
             return pyarrow.list_(PyarrowFieldParser.from_paimon_type(data_type.element))
         elif isinstance(data_type, MapType):
@@ -406,7 +425,7 @@ class PyarrowFieldParser:
             value_type = PyarrowFieldParser.from_paimon_type(data_type.value)
             return pyarrow.map_(key_type, value_type)
         else:
-            raise ValueError(f"Unsupported data type: {data_type}")
+            raise ValueError("Unsupported data type: {}".format(data_type))
 
     @staticmethod
     def from_paimon_field(data_field: DataField) -> pyarrow.Field:
@@ -452,7 +471,7 @@ class PyarrowFieldParser:
             match = re.match(r'decimal\((\d+),\s*(\d+)\)', type_name)
             if match:
                 precision, scale = map(int, match.groups())
-                type_name = f'DECIMAL({precision},{scale})'
+                type_name = 'DECIMAL({},{})'.format(precision, scale)
             else:
                 type_name = 'DECIMAL(38,18)'
         elif type_name.startswith('list'):
@@ -465,8 +484,8 @@ class PyarrowFieldParser:
             value_type = PyarrowFieldParser.to_paimon_type(pa_type.item_type, nullable)
             return MapType(nullable, key_type, value_type)
         else:
-            raise ValueError(f"Unknown type: {type_name}")
-        return AtomicType(type_name)
+            raise ValueError("Unknown type: {}".format(type_name))
+        return AtomicType(type_name, nullable)
 
     @staticmethod
     def to_paimon_field(field_idx: int, pa_field: pyarrow.Field) -> DataField:
@@ -531,9 +550,9 @@ class PyarrowFieldParser:
                 "items": PyarrowFieldParser.to_avro_type(value_field.type, value_field.name)
             }
         elif pyarrow.types.is_struct(field_type):
-            return PyarrowFieldParser.to_avro_schema(field_type, name=f"{field_name}_record")
+            return PyarrowFieldParser.to_avro_schema(field_type, name="{}_record".format(field_name))
 
-        raise ValueError(f"Unsupported pyarrow type for Avro conversion: {field_type}")
+        raise ValueError("Unsupported pyarrow type for Avro conversion: {}".format(field_type))
 
     @staticmethod
     def to_avro_schema(pyarrow_schema: Union[pyarrow.Schema, pyarrow.StructType],

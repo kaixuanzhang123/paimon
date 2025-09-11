@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class ManifestCommittableSerializerCompatibilityTest {
 
     @Test
-    public void testCompatibilityToV4CommitV8() throws IOException {
+    public void testCompatibilityToV4CommitV9() throws IOException {
         SimpleStats keyStats =
                 new SimpleStats(
                         singleColumn("min_key"),
@@ -58,7 +58,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -81,11 +81,95 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         Arrays.asList("asdf", "qwer", "zxcv"));
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        IndexFileMeta indexFile =
+                new IndexFileMeta(
+                        "my_index_type",
+                        "my_index_file",
+                        1024 * 100,
+                        1002,
+                        dvRanges,
+                        "external_path");
+        List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
+
+        CommitMessageImpl commitMessage =
+                new CommitMessageImpl(
+                        singleColumn("my_partition"),
+                        11,
+                        16,
+                        new DataIncrement(dataFiles, dataFiles, dataFiles),
+                        new CompactIncrement(dataFiles, dataFiles, dataFiles),
+                        new IndexIncrement(indexFiles));
+
+        ManifestCommittable manifestCommittable =
+                new ManifestCommittable(
+                        5,
+                        202020L,
+                        Collections.singletonMap(5, 555L),
+                        Collections.singletonList(commitMessage));
+        manifestCommittable.addProperty("k1", "v1");
+        manifestCommittable.addProperty("k2", "v2");
+
+        ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
+        byte[] bytes = serializer.serialize(manifestCommittable);
+
+        ManifestCommittable deserialized = serializer.deserialize(serializer.getVersion(), bytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+
+        byte[] oldBytes =
+                IOUtils.readFully(
+                        ManifestCommittableSerializerCompatibilityTest.class
+                                .getClassLoader()
+                                .getResourceAsStream("compatibility/manifest-committable-v9"),
+                        true);
+        deserialized = serializer.deserialize(4, oldBytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+    }
+
+    @Test
+    public void testCompatibilityToV4CommitV8() throws IOException {
+        SimpleStats keyStats =
+                new SimpleStats(
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        fromLongArray(new Long[] {0L}));
+        SimpleStats valueStats =
+                new SimpleStats(
+                        singleColumn("min_value"),
+                        singleColumn("max_value"),
+                        fromLongArray(new Long[] {0L}));
+        DataFileMeta dataFile =
+                DataFileMeta.create(
+                        "my_file",
+                        1024 * 1024,
+                        1024,
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        keyStats,
+                        valueStats,
+                        15,
+                        200,
+                        5,
+                        3,
+                        Arrays.asList("extra1", "extra2"),
+                        Timestamp.fromLocalDateTime(LocalDateTime.parse("2022-03-02T20:20:12")),
+                        11L,
+                        new byte[] {1, 2, 4},
+                        FileSource.COMPACT,
+                        Arrays.asList("field1", "field2", "field3"),
+                        "hdfs://localhost:9000/path/to/file",
+                        1L,
+                        null);
+        List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
+
         LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
         dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
         dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -135,7 +219,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -158,11 +242,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -211,7 +296,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -234,11 +319,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -285,7 +371,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -308,11 +394,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -359,7 +446,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -382,11 +469,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -432,7 +520,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -455,11 +543,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -506,7 +595,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -529,11 +618,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -580,7 +670,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -603,11 +693,12 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         null);
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
-        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>();
-        dvMetas.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
-        dvMetas.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, null));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, null));
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, dvMetas);
+                new IndexFileMeta(
+                        "my_index_type", "my_index_file", 1024 * 100, 1002, dvRanges, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =
@@ -654,7 +745,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                         singleColumn("max_value"),
                         fromLongArray(new Long[] {0L}));
         DataFileMeta dataFile =
-                new DataFileMeta(
+                DataFileMeta.create(
                         "my_file",
                         1024 * 1024,
                         1024,
@@ -678,7 +769,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
         List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
 
         IndexFileMeta indexFile =
-                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, null);
+                new IndexFileMeta("my_index_type", "my_index_file", 1024 * 100, 1002, null, null);
         List<IndexFileMeta> indexFiles = Collections.singletonList(indexFile);
 
         CommitMessageImpl commitMessage =

@@ -387,7 +387,10 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             }
         } finally {
             long commitDuration = (System.nanoTime() - started) / 1_000_000;
-            LOG.info("Finished commit to table {}, duration {} ms", tableName, commitDuration);
+            LOG.info(
+                    "Finished (Uncertain of success) commit to table {}, duration {} ms",
+                    tableName,
+                    commitDuration);
             if (this.commitMetrics != null) {
                 reportCommit(
                         appendTableFiles,
@@ -774,7 +777,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             totalBuckets = numBucket;
         }
 
-        return new ManifestEntry(
+        return ManifestEntry.create(
                 kind, commitMessage.partition(), commitMessage.bucket(), totalBuckets, file);
     }
 
@@ -853,7 +856,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             List<ManifestEntry> currentEntries = scan.plan().files();
             for (ManifestEntry entry : currentEntries) {
                 changesWithOverwrite.add(
-                        new ManifestEntry(
+                        ManifestEntry.create(
                                 FileKind.DELETE,
                                 entry.partition(),
                                 entry.bucket(),
@@ -1162,9 +1165,11 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         if (strictModeLastSafeSnapshot != null) {
             strictModeLastSafeSnapshot = newSnapshot.id();
         }
-        final List<ManifestEntry> finalDeltaFiels = deltaFiles;
+        final List<SimpleFileEntry> finalBaseFiles = baseDataFiles;
+        final List<ManifestEntry> finalDeltaFiles = deltaFiles;
         commitCallbacks.forEach(
-                callback -> callback.call(finalDeltaFiels, indexFiles, newSnapshot));
+                callback ->
+                        callback.call(finalBaseFiles, finalDeltaFiles, indexFiles, newSnapshot));
         return new SuccessResult();
     }
 
