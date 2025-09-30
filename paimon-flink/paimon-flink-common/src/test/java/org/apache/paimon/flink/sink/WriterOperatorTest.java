@@ -27,7 +27,6 @@ import org.apache.paimon.flink.utils.TestingMetricUtils;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.io.CompactIncrement;
-import org.apache.paimon.io.IndexIncrement;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
@@ -550,7 +549,7 @@ public class WriterOperatorTest {
         return new RowDataStoreWriteOperator.Factory(
                 fileStoreTable,
                 null,
-                (table, commitUser, state, ioManager, memoryPool, metricGroup) ->
+                (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) ->
                         new LookupSinkWrite(
                                 table,
                                 commitUser,
@@ -559,7 +558,7 @@ public class WriterOperatorTest {
                                 false,
                                 waitCompaction,
                                 true,
-                                memoryPool,
+                                memoryPoolFactory,
                                 metricGroup),
                 commitUser);
     }
@@ -596,8 +595,7 @@ public class WriterOperatorTest {
                             message.bucket(),
                             message.totalBuckets(),
                             message.newFilesIncrement(),
-                            CompactIncrement.emptyIncrement(),
-                            new IndexIncrement(Collections.emptyList()));
+                            CompactIncrement.emptyIncrement());
             commitMessages.add(newMessage);
         }
         commit.commit(commitIdentifier, commitMessages);

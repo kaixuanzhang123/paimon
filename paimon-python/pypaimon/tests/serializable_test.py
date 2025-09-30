@@ -23,8 +23,8 @@ import unittest
 
 import pyarrow as pa
 
-from pypaimon.catalog.catalog_factory import CatalogFactory
-from pypaimon.schema.schema import Schema
+from pypaimon import CatalogFactory
+from pypaimon import Schema
 
 
 class SerializableTest(unittest.TestCase):
@@ -54,7 +54,7 @@ class SerializableTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tempdir, ignore_errors=True)
 
-    def testPickleSerializable(self):
+    def test_pickle_serializable(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema,
                                             partition_keys=['dt'],
                                             primary_keys=['user_id', 'dt'],

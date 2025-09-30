@@ -21,9 +21,11 @@ import tempfile
 import unittest
 
 import pyarrow as pa
+import numpy as np
+import pandas as pd
 
-from pypaimon.catalog.catalog_factory import CatalogFactory
-from pypaimon.schema.schema import Schema
+from pypaimon import CatalogFactory
+from pypaimon import Schema
 
 
 class AoReaderTest(unittest.TestCase):
@@ -49,7 +51,7 @@ class AoReaderTest(unittest.TestCase):
             'dt': ['p1', 'p1', 'p2', 'p1', 'p2', 'p1', 'p2', 'p2'],
         }, schema=cls.pa_schema)
 
-    def testParquetAppendOnlyReader(self):
+    def test_parquet_ao_reader(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
         self.catalog.create_table('default.test_append_only_parquet', schema, False)
         table = self.catalog.get_table('default.test_append_only_parquet')
@@ -59,7 +61,7 @@ class AoReaderTest(unittest.TestCase):
         actual = self._read_test_table(read_builder).sort_by('user_id')
         self.assertEqual(actual, self.expected)
 
-    def testOrcAppendOnlyReader(self):
+    def test_orc_ao_reader(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'], options={'file.format': 'orc'})
         self.catalog.create_table('default.test_append_only_orc', schema, False)
         table = self.catalog.get_table('default.test_append_only_orc')
@@ -69,7 +71,7 @@ class AoReaderTest(unittest.TestCase):
         actual = self._read_test_table(read_builder).sort_by('user_id')
         self.assertEqual(actual, self.expected)
 
-    def testAvroAppendOnlyReader(self):
+    def test_avro_ao_reader(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'], options={'file.format': 'avro'})
         self.catalog.create_table('default.test_append_only_avro', schema, False)
         table = self.catalog.get_table('default.test_append_only_avro')
@@ -113,7 +115,81 @@ class AoReaderTest(unittest.TestCase):
         actual = self._read_test_table(read_builder).sort_by('user_id')
         self.assertEqual(actual, self.expected)
 
-    def testAppendOnlyReaderWithFilter(self):
+    def test_over_1000_cols_read(self):
+        num_rows = 1
+        num_cols = 10
+        table_name = "default.testBug"
+        # Generate dynamic schema based on column count
+        schema_fields = []
+        for i in range(1, num_cols + 1):
+            col_name = f'c{i:03d}'
+            if i == 1:
+                schema_fields.append((col_name, pa.string()))  # ID column
+            elif i == 2:
+                schema_fields.append((col_name, pa.string()))  # Name column
+            elif i == 3:
+                schema_fields.append((col_name, pa.string()))  # Category column (partition key)
+            elif i % 4 == 0:
+                schema_fields.append((col_name, pa.float64()))  # Float columns
+            elif i % 4 == 1:
+                schema_fields.append((col_name, pa.int32()))  # Int columns
+            elif i % 4 == 2:
+                schema_fields.append((col_name, pa.string()))  # String columns
+            else:
+                schema_fields.append((col_name, pa.int64()))  # Long columns
+
+        pa_schema = pa.schema(schema_fields)
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            partition_keys=['c003'],  # Use c003 as partition key
+        )
+
+        # Create table
+        self.catalog.create_table(table_name, schema, False)
+        table = self.catalog.get_table(table_name)
+
+        # Generate test data
+        np.random.seed(42)  # For reproducible results
+        categories = ['Electronics', 'Clothing', 'Books', 'Home', 'Sports', 'Food', 'Toys', 'Beauty', 'Health', 'Auto']
+        statuses = ['Active', 'Inactive', 'Pending', 'Completed']
+
+        # Generate data dictionary
+        test_data = {}
+        for i in range(1, num_cols + 1):
+            col_name = f'c{i:03d}'
+            if i == 1:
+                test_data[col_name] = [f'Product_{j}' for j in range(1, num_rows + 1)]
+            elif i == 2:
+                test_data[col_name] = [f'Product_{j}' for j in range(1, num_rows + 1)]
+            elif i == 3:
+                test_data[col_name] = np.random.choice(categories, num_rows)
+            elif i % 4 == 0:
+                test_data[col_name] = np.random.uniform(1.0, 1000.0, num_rows).round(2)
+            elif i % 4 == 1:
+                test_data[col_name] = np.random.randint(1, 100, num_rows)
+            elif i % 4 == 2:
+                test_data[col_name] = np.random.choice(statuses, num_rows)
+            else:
+                test_data[col_name] = np.random.randint(1640995200, 1672531200, num_rows)
+
+        test_df = pd.DataFrame(test_data)
+
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+
+        table_write.write_pandas(test_df)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_pandas(table_scan.plan().splits())
+        self.assertEqual(result.to_dict(), test_df.to_dict())
+
+    def test_ao_reader_with_filter(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
         self.catalog.create_table('default.test_append_only_filter', schema, False)
         table = self.catalog.get_table('default.test_append_only_filter')
@@ -167,7 +243,7 @@ class AoReaderTest(unittest.TestCase):
         ])
         self.assertEqual(actual.sort_by('user_id'), expected)
 
-    def testAppendOnlyReaderWithProjection(self):
+    def test_ao_reader_with_projection(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
         self.catalog.create_table('default.test_append_only_projection', schema, False)
         table = self.catalog.get_table('default.test_append_only_projection')
@@ -178,7 +254,7 @@ class AoReaderTest(unittest.TestCase):
         expected = self.expected.select(['dt', 'user_id'])
         self.assertEqual(actual, expected)
 
-    def testAvroAppendOnlyReaderWithProjection(self):
+    def test_avro_ao_reader_with_projection(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'], options={'file.format': 'avro'})
         self.catalog.create_table('default.test_avro_append_only_projection', schema, False)
         table = self.catalog.get_table('default.test_avro_append_only_projection')
@@ -189,7 +265,7 @@ class AoReaderTest(unittest.TestCase):
         expected = self.expected.select(['dt', 'user_id'])
         self.assertEqual(actual, expected)
 
-    def testAppendOnlyReaderWithLimit(self):
+    def test_ao_reader_with_limit(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
         self.catalog.create_table('default.test_append_only_limit', schema, False)
         table = self.catalog.get_table('default.test_append_only_limit')

@@ -26,7 +26,7 @@ import org.apache.paimon.data.serializer.InternalSerializers
 import org.apache.paimon.deletionvectors.DeletionVector
 import org.apache.paimon.deletionvectors.append.BaseAppendDeleteFileMaintainer
 import org.apache.paimon.index.{BucketAssigner, SimpleHashBucketAssigner}
-import org.apache.paimon.io.{CompactIncrement, DataIncrement, IndexIncrement}
+import org.apache.paimon.io.{CompactIncrement, DataIncrement}
 import org.apache.paimon.manifest.FileKind
 import org.apache.paimon.spark.{SparkRow, SparkTableWrite, SparkTypeUtils}
 import org.apache.paimon.spark.catalog.functions.BucketFunction
@@ -51,7 +51,7 @@ import java.util.Collections.singletonMap
 
 import scala.collection.JavaConverters._
 
-case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = false)
+case class PaimonSparkWriter(table: FileStoreTable, writeRowTracking: Boolean = false)
   extends WriteHelper {
 
   private lazy val tableSchema = table.schema
@@ -61,8 +61,8 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
   @transient private lazy val serializer = new CommitMessageSerializer
 
   private val writeType = {
-    if (writeRowLineage) {
-      SpecialFields.rowTypeWithRowLineage(table.rowType(), true)
+    if (writeRowTracking) {
+      SpecialFields.rowTypeWithRowTracking(table.rowType(), true)
     } else {
       table.rowType()
     }
@@ -74,9 +74,9 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
     PaimonSparkWriter(table.copy(singletonMap(WRITE_ONLY.key(), "true")))
   }
 
-  def withRowLineage(): PaimonSparkWriter = {
+  def withRowTracking(): PaimonSparkWriter = {
     if (coreOptions.rowTrackingEnabled()) {
-      PaimonSparkWriter(table, writeRowLineage = true)
+      PaimonSparkWriter(table, writeRowTracking = true)
     } else {
       this
     }
@@ -88,7 +88,7 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
 
     val withInitBucketCol = bucketMode match {
       case BUCKET_UNAWARE => data
-      case CROSS_PARTITION if !data.schema.fieldNames.contains(ROW_KIND_COL) =>
+      case KEY_DYNAMIC if !data.schema.fieldNames.contains(ROW_KIND_COL) =>
         data
           .withColumn(ROW_KIND_COL, lit(RowKind.INSERT.toByteValue))
           .withColumn(BUCKET_COL, lit(-1))
@@ -98,7 +98,7 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
     val bucketColIdx = SparkRowUtils.getFieldIndex(withInitBucketCol.schema, BUCKET_COL)
     val encoderGroupWithBucketCol = EncoderSerDeGroup(withInitBucketCol.schema)
 
-    def newWrite() = SparkTableWrite(writeBuilder, writeType, rowKindColIdx, writeRowLineage)
+    def newWrite() = SparkTableWrite(writeBuilder, writeType, rowKindColIdx, writeRowTracking)
 
     def sparkParallelism = {
       val defaultParallelism = sparkSession.sparkContext.defaultParallelism
@@ -165,7 +165,7 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
     }
 
     val written: Dataset[Array[Byte]] = bucketMode match {
-      case CROSS_PARTITION =>
+      case KEY_DYNAMIC =>
         // Topology: input -> bootstrap -> shuffle by key hash -> bucket-assigner -> shuffle by partition & bucket
         val rowType = SparkTypeUtils.toPaimonType(withInitBucketCol.schema).asInstanceOf[RowType]
         val assignerParallelism = Option(coreOptions.dynamicBucketAssignerParallelism)
@@ -258,7 +258,7 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
           }
         }
         val clusteringColumns = coreOptions.clusteringColumns()
-        if (!clusteringColumns.isEmpty) {
+        if ((!coreOptions.clusteringIncrementalEnabled()) && (!clusteringColumns.isEmpty)) {
           val strategy = coreOptions.clusteringStrategy(tableSchema.fields().size())
           val sorter = TableSorter.getSorter(table, strategy, clusteringColumns)
           input = sorter.sort(data)
@@ -344,9 +344,13 @@ case class PaimonSparkWriter(table: FileStoreTable, writeRowLineage: Boolean = f
             dvIndexFileMaintainer.getPartition,
             dvIndexFileMaintainer.getBucket,
             null,
-            DataIncrement.emptyIncrement(),
-            CompactIncrement.emptyIncrement(),
-            new IndexIncrement(added.map(_.indexFile).asJava, deleted.map(_.indexFile).asJava)
+            new DataIncrement(
+              java.util.Collections.emptyList(),
+              java.util.Collections.emptyList(),
+              java.util.Collections.emptyList(),
+              added.map(_.indexFile).asJava,
+              deleted.map(_.indexFile).asJava),
+            CompactIncrement.emptyIncrement()
           )
           val serializer = new CommitMessageSerializer
           serializer.serialize(commitMessage)

@@ -26,13 +26,10 @@ import pandas
 from pypaimon import PaimonVirtualFileSystem
 from pypaimon.api.api_response import ConfigResponse
 from pypaimon.api.auth import BearTokenAuthProvider
-from pypaimon.catalog.rest.table_metadata import TableMetadata
-from pypaimon.schema.data_types import AtomicType, DataField
-from pypaimon.schema.table_schema import TableSchema
-from pypaimon.tests.api_test import RESTCatalogServer
+from pypaimon.tests.rest.api_test import RESTCatalogServer
 
 
-class PVFSTestCase(unittest.TestCase):
+class PVFSTest(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix="unittest_")
@@ -67,17 +64,6 @@ class PVFSTestCase(unittest.TestCase):
         self.test_databases = {
             self.database: self.server.mock_database(self.database, {"k1": "v1", "k2": "v2"}),
         }
-        data_fields = [
-            DataField(0, "id", AtomicType('INT'), 'id'),
-            DataField(1, "name", AtomicType('STRING'), 'name')
-        ]
-        schema = TableSchema(TableSchema.CURRENT_VERSION, len(data_fields), data_fields, len(data_fields),
-                             [], [], {}, "")
-        self.server.database_store.update(self.test_databases)
-        self.test_tables = {
-            f"{self.database}.{self.table}": TableMetadata(uuid=str(uuid.uuid4()), is_external=True, schema=schema),
-        }
-        self.server.table_metadata_store.update(self.test_tables)
 
     def tearDown(self):
         if self.temp_path.exists():

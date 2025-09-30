@@ -24,18 +24,19 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import splitport, urlparse
 
 import pyarrow
+from packaging.version import parse
 from pyarrow._fs import FileSystem
 
 from pypaimon.common.config import OssOptions, S3Options
 
 
 class FileIO:
-    def __init__(self, warehouse: str, catalog_options: dict):
+    def __init__(self, path: str, catalog_options: dict):
         self.properties = catalog_options
         self.logger = logging.getLogger(__name__)
-        scheme, netloc, path = self.parse_location(warehouse)
+        scheme, netloc, _ = self.parse_location(path)
         if scheme in {"oss"}:
-            self.filesystem = self._initialize_oss_fs()
+            self.filesystem = self._initialize_oss_fs(path)
         elif scheme in {"s3", "s3a", "s3n"}:
             self.filesystem = self._initialize_s3_fs()
         elif scheme in {"hdfs", "viewfs"}:
@@ -55,16 +56,46 @@ class FileIO:
         else:
             return uri.scheme, uri.netloc, f"{uri.netloc}{uri.path}"
 
-    def _initialize_oss_fs(self) -> FileSystem:
+    def _extract_oss_bucket(self, location) -> str:
+        uri = urlparse(location)
+        if uri.scheme and uri.scheme != "oss":
+            raise ValueError("Not an OSS URI: {}".format(location))
+
+        netloc = uri.netloc or ""
+        # parse oss://access_id:secret_key@Endpoint/bucket/path/to/object
+        if (getattr(uri, "username", None) or getattr(uri, "password", None)) or ("@" in netloc):
+            first_segment = uri.path.lstrip("/").split("/", 1)[0]
+            if not first_segment:
+                raise ValueError("Invalid OSS URI without bucket: {}".format(location))
+            return first_segment
+
+        # parse oss://bucket/... or oss://bucket.endpoint/...
+        host = getattr(uri, "hostname", None) or netloc
+        if not host:
+            raise ValueError("Invalid OSS URI without host: {}".format(location))
+        bucket = host.split(".", 1)[0]
+        if not bucket:
+            raise ValueError("Invalid OSS URI without bucket: {}".format(location))
+        return bucket
+
+    def _initialize_oss_fs(self, path) -> FileSystem:
         from pyarrow.fs import S3FileSystem
-        bucket_name = self.properties.get("prefix")
+
         client_kwargs = {
-            "endpoint_override": bucket_name + "." + self.properties.get(OssOptions.OSS_ENDPOINT),
             "access_key": self.properties.get(OssOptions.OSS_ACCESS_KEY_ID),
             "secret_key": self.properties.get(OssOptions.OSS_ACCESS_KEY_SECRET),
             "session_token": self.properties.get(OssOptions.OSS_SECURITY_TOKEN),
             "region": self.properties.get(OssOptions.OSS_REGION),
         }
+
+        # Based on https://github.com/apache/arrow/issues/40506
+        if parse(pyarrow.__version__) >= parse("7.0.0"):
+            client_kwargs['force_virtual_addressing'] = True
+            client_kwargs['endpoint_override'] = self.properties.get(OssOptions.OSS_ENDPOINT)
+        else:
+            oss_bucket = self._extract_oss_bucket(path)
+            client_kwargs['endpoint_override'] = (oss_bucket + "." +
+                                                  self.properties.get(OssOptions.OSS_ENDPOINT))
 
         return S3FileSystem(**client_kwargs)
 
