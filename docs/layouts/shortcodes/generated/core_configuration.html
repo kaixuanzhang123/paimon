@@ -51,7 +51,13 @@ under the License.
             <td>Whether to create underlying storage when reading and writing the table.</td>
         </tr>
         <tr>
-            <td><h5>blob.field</h5></td>
+            <td><h5>blob-as-descriptor</h5></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Write blob field using blob descriptor rather than blob bytes.</td>
+        </tr>
+        <tr>
+            <td><h5>blob-field</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>String</td>
             <td>Specify the blob field.</td>
@@ -534,7 +540,7 @@ under the License.
             <td><h5>full-compaction.delta-commits</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>Integer</td>
-            <td>Full compaction will be constantly triggered after delta commits.</td>
+            <td>For streaming write, full compaction will be constantly triggered after delta commits. For batch write, full compaction will be triggered with each commit as long as this value is greater than 0.</td>
         </tr>
         <tr>
             <td><h5>ignore-delete</h5></td>
@@ -559,6 +565,12 @@ under the License.
             <td style="word-wrap: break-word;">auto</td>
             <td><p>Enum</p></td>
             <td>Scan kind when Read incremental changes between start snapshot (exclusive) and end snapshot (inclusive). <br /><br />Possible values:<ul><li>"auto": Scan changelog files for the table which produces changelog files. Otherwise, scan newly changed files.</li><li>"delta": Scan newly changed files between snapshots.</li><li>"changelog": Scan changelog files between snapshots.</li><li>"diff": Get diff by comparing data of end snapshot with data of start snapshot.</li></ul></td>
+        </tr>
+        <tr>
+            <td><h5>incremental-between-tag-to-snapshot</h5></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Whether to read incremental changes between the snapshot corresponding to the tag.</td>
         </tr>
         <tr>
             <td><h5>incremental-between-timestamp</h5></td>

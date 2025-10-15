@@ -1204,7 +1204,8 @@ public class CoreOptions implements Serializable {
                     .intType()
                     .noDefaultValue()
                     .withDescription(
-                            "Full compaction will be constantly triggered after delta commits.");
+                            "For streaming write, full compaction will be constantly triggered after delta commits. "
+                                    + "For batch write, full compaction will be triggered with each commit as long as this value is greater than 0.");
 
     @ExcludeFromDocumentation("Internal use only")
     public static final ConfigOption<StreamScanMode> STREAM_SCAN_MODE =
@@ -1315,6 +1316,13 @@ public class CoreOptions implements Serializable {
                             "Used to specify the end tag (inclusive), and Paimon will find an earlier tag and return changes between them. "
                                     + "If the tag doesn't exist or the earlier tag doesn't exist, return empty. "
                                     + "This option requires 'tag.creation-period' and 'tag.period-formatter' configured.");
+
+    public static final ConfigOption<Boolean> INCREMENTAL_BETWEEN_TAG_TO_SNAPSHOT =
+            key("incremental-between-tag-to-snapshot")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to read incremental changes between the snapshot corresponding to the tag.");
 
     public static final ConfigOption<Boolean> END_INPUT_CHECK_PARTITION_EXPIRE =
             key("end-input.check-partition-expire")
@@ -1990,10 +1998,17 @@ public class CoreOptions implements Serializable {
                     .withDescription("Format table file path only contain partition value.");
 
     public static final ConfigOption<String> BLOB_FIELD =
-            key("blob.field")
+            key("blob-field")
                     .stringType()
                     .noDefaultValue()
                     .withDescription("Specify the blob field.");
+
+    public static final ConfigOption<Boolean> BLOB_AS_DESCRIPTOR =
+            key("blob-as-descriptor")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Write blob field using blob descriptor rather than blob bytes.");
 
     private final Options options;
 
@@ -2665,6 +2680,10 @@ public class CoreOptions implements Serializable {
         return options.get(INCREMENTAL_TO_AUTO_TAG);
     }
 
+    public boolean incrementalBetweenTagToSnapshot() {
+        return options.get(INCREMENTAL_BETWEEN_TAG_TO_SNAPSHOT);
+    }
+
     public Integer scanManifestParallelism() {
         return options.get(SCAN_MANIFEST_PARALLELISM);
     }
@@ -2786,6 +2805,11 @@ public class CoreOptions implements Serializable {
             throw new RuntimeException("consumer id cannot be empty string.");
         }
         return consumerId;
+    }
+
+    @Nullable
+    public Integer fullCompactionDeltaCommits() {
+        return options.get(FULL_COMPACTION_DELTA_COMMITS);
     }
 
     public static StreamingReadMode streamReadType(Options options) {
@@ -3063,6 +3087,10 @@ public class CoreOptions implements Serializable {
 
     public boolean formatTablePartitionOnlyValueInPath() {
         return options.get(FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH);
+    }
+
+    public boolean blobAsDescriptor() {
+        return options.get(BLOB_AS_DESCRIPTOR);
     }
 
     /** Specifies the merge engine for table with primary key. */
