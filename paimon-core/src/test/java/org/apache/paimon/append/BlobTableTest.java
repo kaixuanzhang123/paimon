@@ -28,15 +28,20 @@ import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.operation.DataEvolutionSplitRead;
+import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.table.TableTestBase;
-import org.apache.paimon.table.source.DataEvolutionSplitGenerator;
+import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
+import javax.annotation.Nonnull;
+
 import java.io.ByteArrayInputStream;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -108,7 +113,7 @@ public class BlobTableTest extends TableTestBase {
                         .map(ManifestEntry::file)
                         .collect(Collectors.toList());
 
-        List<List<DataFileMeta>> batches = DataEvolutionSplitGenerator.split(filesMetas);
+        List<List<DataFileMeta>> batches = DataEvolutionSplitRead.mergeRangesAndSort(filesMetas);
         assertThat(batches.size()).isEqualTo(2);
         for (List<DataFileMeta> batch : batches) {
             List<DataEvolutionSplitRead.FieldBunch> fieldGroups =
@@ -125,6 +130,53 @@ public class BlobTableTest extends TableTestBase {
                     }
                 });
         assertThat(integer.get()).isEqualTo(200);
+    }
+
+    @Test
+    public void testRowIdPushDown() throws Exception {
+        createTableDefault();
+        writeDataDefault(
+                new Iterable<InternalRow>() {
+                    @Nonnull
+                    @Override
+                    public Iterator<InternalRow> iterator() {
+                        return new Iterator<InternalRow>() {
+                            int i = 0;
+
+                            @Override
+                            public boolean hasNext() {
+                                return i < 200;
+                            }
+
+                            @Override
+                            public InternalRow next() {
+                                i++;
+                                return (i - 1) == 100
+                                        ? GenericRow.of(
+                                                i,
+                                                BinaryString.fromString("nice"),
+                                                new BlobData(
+                                                        "This is the specified message".getBytes()))
+                                        : dataDefault(0, 0);
+                            }
+                        };
+                    }
+                });
+
+        Table table = getTableDefault();
+        ReadBuilder readBuilder =
+                table.newReadBuilder().withRowIds(Collections.singletonList(100L));
+        RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan());
+
+        AtomicInteger i = new AtomicInteger(0);
+        reader.forEachRemaining(
+                row -> {
+                    i.getAndIncrement();
+                    assertThat(row.getBlob(2).toData())
+                            .isEqualTo("This is the specified message".getBytes());
+                });
+        assertThat(i.get()).isEqualTo(1);
     }
 
     protected Schema schemaDefault() {
