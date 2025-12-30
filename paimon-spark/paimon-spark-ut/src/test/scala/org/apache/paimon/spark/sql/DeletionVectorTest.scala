@@ -21,7 +21,8 @@ package org.apache.paimon.spark.sql
 import org.apache.paimon.data.BinaryRow
 import org.apache.paimon.deletionvectors.{BucketedDvMaintainer, BucketedDvMaintainerTest, DeletionVector}
 import org.apache.paimon.fs.Path
-import org.apache.paimon.spark.{PaimonSparkTestBase, PaimonSplitScan}
+import org.apache.paimon.spark.PaimonSparkTestBase
+import org.apache.paimon.spark.scan.PaimonSplitScan
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.table.FileStoreTable
 
@@ -149,8 +150,7 @@ class DeletionVectorTest extends PaimonSparkTestBase with AdaptiveSparkPlanHelpe
 
   bucketModes.foreach {
     bucket =>
-      test(
-        s"Paimon DeletionVector: update for append non-partitioned table with bucket = $bucket") {
+      test(s"Paimon DeletionVector: update for append non-partitioned table with bucket = $bucket") {
         withTable("T") {
           val bucketKey = if (bucket > 1) {
             ", 'bucket-key' = 'id'"
@@ -309,8 +309,7 @@ class DeletionVectorTest extends PaimonSparkTestBase with AdaptiveSparkPlanHelpe
 
   bucketModes.foreach {
     bucket =>
-      test(
-        s"Paimon DeletionVector: delete for append non-partitioned table with bucket = $bucket") {
+      test(s"Paimon DeletionVector: delete for append non-partitioned table with bucket = $bucket") {
         withTable("T") {
           val bucketKey = if (bucket > 1) {
             ", 'bucket-key' = 'id'"

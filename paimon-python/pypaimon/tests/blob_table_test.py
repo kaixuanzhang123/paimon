@@ -17,12 +17,13 @@ limitations under the License.
 """
 import os
 import shutil
+import struct
 import tempfile
 import unittest
 
 import pyarrow as pa
 
-from pypaimon import CatalogFactory
+from pypaimon import CatalogFactory, Schema
 from pypaimon.table.file_store_table import FileStoreTable
 from pypaimon.write.commit_message import CommitMessage
 
@@ -975,7 +976,7 @@ class DataBlobWriterTest(unittest.TestCase):
         from pypaimon import Schema
         from pypaimon.table.row.blob import BlobDescriptor, Blob
         from pypaimon.common.uri_reader import UriReaderFactory
-        from pypaimon.common.config import CatalogOptions
+        from pypaimon.common.options.config import CatalogOptions
 
         # Create schema with blob column
         pa_schema = pa.schema([
@@ -1054,10 +1055,17 @@ class DataBlobWriterTest(unittest.TestCase):
         self.assertEqual(new_blob_descriptor.length, len(blob_data), "Length should match")
 
         # Create URI reader factory and read the blob data
-        catalog_options = {CatalogOptions.WAREHOUSE: self.warehouse}
+        catalog_options = {CatalogOptions.WAREHOUSE.key(): self.warehouse}
         uri_reader_factory = UriReaderFactory(catalog_options)
         uri_reader = uri_reader_factory.create(new_blob_descriptor.uri)
         blob = Blob.from_descriptor(uri_reader, new_blob_descriptor)
+
+        blob_descriptor_from_blob = blob.to_descriptor()
+        self.assertEqual(
+            blob_descriptor_from_blob.uri,
+            new_blob_descriptor.uri,
+            f"URI should be preserved. Expected: {new_blob_descriptor.uri}, Got: {blob_descriptor_from_blob.uri}"
+        )
 
         # Verify the blob data matches the original
         self.assertEqual(blob.to_data(), blob_data, "Blob data should match original")
@@ -1155,6 +1163,116 @@ class DataBlobWriterTest(unittest.TestCase):
 
         print(
             f"✅ Large blob end-to-end test passed: wrote and read back {len(blob_data)} large blob records correctly")  # noqa: E501
+
+    def test_blob_write_read_large_data_volume(self):
+        from pypaimon import Schema
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('batch_id', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true'
+            }
+        )
+        self.catalog.create_table('test_db.blob_large_data_volume', schema, False)
+        table = self.catalog.get_table('test_db.blob_large_data_volume')
+
+        large_blob_size = 5 * 1024
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        num_row = 20000
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        expected = pa.Table.from_pydict({
+            'id': [1] * num_row,
+            'batch_id': [11] * num_row,
+            'metadata': [f'Large blob batch {11}'] * num_row,
+            'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
+        }, schema=pa_schema)
+        writer.write_arrow(expected)
+
+        # Commit all data at once
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify the data
+        self.assertEqual(result.num_rows, num_row)
+        self.assertEqual(result.num_columns, 4)
+
+        self.assertEqual(expected, result)
+
+    def test_blob_write_read_large_data_volume_rolling(self):
+        from pypaimon import Schema
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('batch_id', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob.target-file-size': '21MB'
+            }
+        )
+        self.catalog.create_table('test_db.large_data_volume_rolling', schema, False)
+        table = self.catalog.get_table('test_db.large_data_volume_rolling')
+
+        # Create large blob data
+        large_blob_size = 5 * 1024  #
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        actual_size = len(large_blob_data)
+        print(f"Created blob data: {actual_size:,} bytes ({actual_size / (1024 * 1024):.2f} MB)")
+        num_row = 20000
+        expected = pa.Table.from_pydict({
+            'id': [1] * num_row,
+            'batch_id': [11] * num_row,
+            'metadata': [f'Large blob batch {11}'] * num_row,
+            'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
+        }, schema=pa_schema)
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(expected)
+
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+        self.assertEqual(expected, result)
 
     def test_blob_write_read_mixed_sizes_end_to_end(self):
         """Test end-to-end blob functionality with mixed blob sizes."""
@@ -1376,68 +1494,6 @@ class DataBlobWriterTest(unittest.TestCase):
             f"   - Total data size: {total_blob_size:,} bytes ({total_blob_size / (1024 * 1024 * 1024):.2f} GB)")  # noqa: E501
         print("   - All blob content verified as correct")
 
-    def test_data_blob_writer_with_shard(self):
-        """Test DataBlobWriter with mixed data types in blob column."""
-        from pypaimon import Schema
-
-        # Create schema with blob column
-        pa_schema = pa.schema([
-            ('id', pa.int32()),
-            ('type', pa.string()),
-            ('data', pa.large_binary()),
-        ])
-
-        schema = Schema.from_pyarrow_schema(
-            pa_schema,
-            options={
-                'row-tracking.enabled': 'true',
-                'data-evolution.enabled': 'true'
-            }
-        )
-        self.catalog.create_table('test_db.with_shard_test', schema, False)
-        table = self.catalog.get_table('test_db.with_shard_test')
-
-        # Use proper table API to create writer
-        write_builder = table.new_batch_write_builder()
-        blob_writer = write_builder.new_write()
-
-        # Test data with different types of blob content
-        test_data = pa.Table.from_pydict({
-            'id': [1, 2, 3, 4, 5],
-            'type': ['text', 'json', 'binary', 'image', 'pdf'],
-            'data': [
-                b'This is text content',
-                b'{"key": "value", "number": 42}',
-                b'\x00\x01\x02\x03\xff\xfe\xfd',
-                b'PNG_IMAGE_DATA_PLACEHOLDER',
-                b'%PDF-1.4\nPDF_CONTENT_PLACEHOLDER'
-            ]
-        }, schema=pa_schema)
-
-        # Write mixed data
-        total_rows = 0
-        for batch in test_data.to_batches():
-            blob_writer.write_arrow_batch(batch)
-            total_rows += batch.num_rows
-
-        # Test prepare commit
-        commit_messages = blob_writer.prepare_commit()
-        # Create commit and commit the data
-        commit = write_builder.new_commit()
-        commit.commit(commit_messages)
-        blob_writer.close()
-
-        # Read data back using table API
-        read_builder = table.new_read_builder()
-        table_scan = read_builder.new_scan().with_shard(1, 2)
-        table_read = read_builder.new_read()
-        splits = table_scan.plan().splits()
-        result = table_read.to_arrow(splits)
-
-        # Verify the data was read back correctly
-        self.assertEqual(result.num_rows, 3, "Should have 5 rows")
-        self.assertEqual(result.num_columns, 3, "Should have 3 columns")
-
     def test_blob_read_row_by_row_iterator(self):
         """Test reading blob data row by row using to_iterator()."""
         from pypaimon import Schema
@@ -1517,6 +1573,937 @@ class DataBlobWriterTest(unittest.TestCase):
                 row.get_row_kind(),
                 [RowKind.INSERT, RowKind.UPDATE_BEFORE, RowKind.UPDATE_AFTER, RowKind.DELETE],
                 f"Row {row_id}: RowKind should be valid")
+
+    def test_blob_as_descriptor_target_file_size_rolling(self):
+        import random
+        import os
+        from pypaimon import Schema
+        from pypaimon.table.row.blob import BlobDescriptor
+
+        pa_schema = pa.schema([('id', pa.int32()), ('name', pa.string()), ('blob_data', pa.large_binary())])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true', 'data-evolution.enabled': 'true',
+            'blob-as-descriptor': 'true', 'target-file-size': '1MB'
+        })
+        self.catalog.create_table('test_db.blob_target_size_test', schema, False)
+        table = self.catalog.get_table('test_db.blob_target_size_test')
+
+        # Create 5 external blob files (2MB each, > target-file-size)
+        num_blobs, blob_size = 5, 2 * 1024 * 1024
+        random.seed(42)
+        descriptors = []
+        for i in range(num_blobs):
+            path = os.path.join(self.temp_dir, f'external_blob_{i}')
+            data = bytes(bytearray([random.randint(0, 255) for _ in range(blob_size)]))
+            with open(path, 'wb') as f:
+                f.write(data)
+            descriptors.append(BlobDescriptor(path, 0, len(data)))
+
+        # Write data
+        test_data = pa.Table.from_pydict({
+            'id': list(range(1, num_blobs + 1)),
+            'name': [f'item_{i}' for i in range(1, num_blobs + 1)],
+            'blob_data': [d.serialize() for d in descriptors]
+        }, schema=pa_schema)
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Check blob files
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+        total_size = sum(f.file_size for f in blob_files)
+
+        # Verify that rolling works correctly: should have multiple files when total size exceeds target
+        # Each blob is 2MB, target-file-size is 1MB, so should have multiple files
+        self.assertGreater(
+            len(blob_files), 1,
+            f"Should have multiple blob files when total size ({total_size / 1024 / 1024:.2f}MB) exceeds target (1MB), "
+            f"but got {len(blob_files)} file(s)"
+        )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(table.new_read_builder().new_scan().plan().splits())
+        self.assertEqual(result.num_rows, num_blobs)
+        self.assertEqual(result.column('id').to_pylist(), list(range(1, num_blobs + 1)))
+
+    def test_blob_file_name_format_with_shared_uuid(self):
+        import random
+        import re
+        from pypaimon import Schema
+        from pypaimon.table.row.blob import BlobDescriptor
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('blob_data', pa.large_binary())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true',
+            'data-evolution.enabled': 'true',
+            'blob-as-descriptor': 'true',
+            'blob.target-file-size': '1MB'  # Small target size to trigger multiple rollings
+        })
+
+        self.catalog.create_table('test_db.blob_file_name_test', schema, False)
+        table = self.catalog.get_table('test_db.blob_file_name_test')
+
+        # Create multiple external blob files (2MB each, > target-file-size)
+        # This will trigger multiple blob file rollings
+        num_blobs, blob_size = 5, 2 * 1024 * 1024
+        random.seed(789)
+        descriptors = []
+        for i in range(num_blobs):
+            path = os.path.join(self.temp_dir, f'external_blob_{i}')
+            data = bytes(bytearray([random.randint(0, 255) for _ in range(blob_size)]))
+            with open(path, 'wb') as f:
+                f.write(data)
+            descriptors.append(BlobDescriptor(path, 0, len(data)))
+
+        # Write data
+        test_data = pa.Table.from_pydict({
+            'id': list(range(1, num_blobs + 1)),
+            'name': [f'item_{i}' for i in range(1, num_blobs + 1)],
+            'blob_data': [d.serialize() for d in descriptors]
+        }, schema=pa_schema)
+
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # Should have multiple blob files due to rolling
+        self.assertGreater(len(blob_files), 1, "Should have multiple blob files due to rolling")
+
+        # Verify file name format: data-{uuid}-{count}.blob
+        file_name_pattern = re.compile(
+            r'^data-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-'
+            r'[a-f0-9]{12}-(\d+)\.blob$'
+        )
+
+        first_file_name = blob_files[0].file_name
+        self.assertTrue(
+            file_name_pattern.match(first_file_name),
+            f"File name should match expected format: data-{{uuid}}-{{count}}.blob, got: {first_file_name}"
+        )
+
+        first_match = file_name_pattern.match(first_file_name)
+        first_counter = int(first_match.group(1))
+
+        # Extract UUID (everything between "data-" and last "-")
+        uuid_start = len("data-")
+        uuid_end = first_file_name.rfind('-', uuid_start)
+        shared_uuid = first_file_name[uuid_start:uuid_end]
+
+        # Verify all blob files use the same UUID and have sequential counters
+        for i, blob_file in enumerate(blob_files):
+            file_name = blob_file.file_name
+            match = file_name_pattern.match(file_name)
+
+            self.assertIsNotNone(
+                match,
+                f"File name should match expected format: data-{{uuid}}-{{count}}.blob, got: {file_name}"
+            )
+
+            counter = int(match.group(1))
+
+            # Extract UUID from this file
+            file_uuid = file_name[uuid_start:file_name.rfind('-', uuid_start)]
+
+            self.assertEqual(
+                file_uuid,
+                shared_uuid,
+                f"All blob files should use the same UUID. Expected: {shared_uuid}, got: {file_uuid} in {file_name}"
+            )
+
+            self.assertEqual(
+                counter,
+                first_counter + i,
+                f"File counter should be sequential. Expected: {first_counter + i}, got: {counter} in {file_name}"
+            )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(table.new_read_builder().new_scan().plan().splits())
+        self.assertEqual(result.num_rows, num_blobs)
+        self.assertEqual(result.column('id').to_pylist(), list(range(1, num_blobs + 1)))
+
+    def test_blob_as_descriptor_sequence_number_increment(self):
+        import os
+        from pypaimon import Schema
+        from pypaimon.table.row.blob import BlobDescriptor
+
+        # Create schema with blob column (blob-as-descriptor=true)
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('blob_data', pa.large_binary())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true',
+            'data-evolution.enabled': 'true',
+            'blob-as-descriptor': 'true'
+        })
+
+        self.catalog.create_table('test_db.blob_sequence_test', schema, False)
+        table = self.catalog.get_table('test_db.blob_sequence_test')
+
+        # Create multiple external blob files
+        num_blobs = 10
+        descriptors = []
+        for i in range(num_blobs):
+            path = os.path.join(self.temp_dir, f'external_blob_seq_{i}')
+            data = f"blob data {i}".encode('utf-8')
+            with open(path, 'wb') as f:
+                f.write(data)
+            descriptors.append(BlobDescriptor(path, 0, len(data)))
+
+        # Write data row by row (this triggers the one-by-one writing in blob-as-descriptor mode)
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+
+        # Write each row separately to ensure one-by-one writing
+        for i in range(num_blobs):
+            test_data = pa.Table.from_pydict({
+                'id': [i + 1],
+                'name': [f'item_{i}'],
+                'blob_data': [descriptors[i].serialize()]
+            }, schema=pa_schema)
+            writer.write_arrow(test_data)
+
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # Verify that we have at least one blob file
+        self.assertGreater(len(blob_files), 0, "Should have at least one blob file")
+
+        # Verify sequence numbers for each blob file
+        for blob_file in blob_files:
+            min_seq = blob_file.min_sequence_number
+            max_seq = blob_file.max_sequence_number
+            row_count = blob_file.row_count
+
+            # Critical assertion: min_seq should NOT equal max_seq when there are multiple rows
+            if row_count > 1:
+                self.assertNotEqual(
+                    min_seq, max_seq,
+                    f"Sequence numbers should be different for files with multiple rows. "
+                    f"File: {blob_file.file_name}, row_count: {row_count}, "
+                    f"min_seq: {min_seq}, max_seq: {max_seq}. "
+                    f"This indicates sequence generator was not incremented for each row."
+                )
+                self.assertEqual(
+                    max_seq - min_seq + 1, row_count,
+                    f"Sequence number range should match row count. "
+                    f"File: {blob_file.file_name}, row_count: {row_count}, "
+                    f"min_seq: {min_seq}, max_seq: {max_seq}, "
+                    f"expected range: {row_count}, actual range: {max_seq - min_seq + 1}"
+                )
+            else:
+                # For single row files, min_seq == max_seq is acceptable
+                self.assertEqual(
+                    min_seq, max_seq,
+                    f"Single row file should have min_seq == max_seq. "
+                    f"File: {blob_file.file_name}, min_seq: {min_seq}, max_seq: {max_seq}"
+                )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(table.new_read_builder().new_scan().plan().splits())
+        self.assertEqual(result.num_rows, num_blobs)
+        self.assertEqual(result.column('id').to_pylist(), list(range(1, num_blobs + 1)))
+
+    def test_blob_non_descriptor_sequence_number_increment(self):
+        from pypaimon import Schema
+
+        # Create schema with blob column (blob-as-descriptor=false, normal mode)
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('blob_data', pa.large_binary())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true',
+            'data-evolution.enabled': 'true',
+            'blob-as-descriptor': 'false'  # Normal mode, not descriptor mode
+        })
+
+        self.catalog.create_table('test_db.blob_sequence_non_desc_test', schema, False)
+        table = self.catalog.get_table('test_db.blob_sequence_non_desc_test')
+
+        # Create test data with multiple rows in a batch
+        num_rows = 10
+        test_data = pa.Table.from_pydict({
+            'id': list(range(1, num_rows + 1)),
+            'name': [f'item_{i}' for i in range(num_rows)],
+            'blob_data': [f'blob data {i}'.encode('utf-8') for i in range(num_rows)]
+        }, schema=pa_schema)
+
+        # Write data as a batch (this triggers batch writing in non-descriptor mode)
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # Verify that we have at least one blob file
+        self.assertGreater(len(blob_files), 0, "Should have at least one blob file")
+
+        # Verify sequence numbers for each blob file
+        for blob_file in blob_files:
+            min_seq = blob_file.min_sequence_number
+            max_seq = blob_file.max_sequence_number
+            row_count = blob_file.row_count
+
+            # Critical assertion: min_seq should NOT equal max_seq when there are multiple rows
+            if row_count > 1:
+                self.assertNotEqual(
+                    min_seq, max_seq,
+                    f"Sequence numbers should be different for files with multiple rows. "
+                    f"File: {blob_file.file_name}, row_count: {row_count}, "
+                    f"min_seq: {min_seq}, max_seq: {max_seq}. "
+                    f"This indicates sequence generator was not incremented for each row in batch."
+                )
+                self.assertEqual(
+                    max_seq - min_seq + 1, row_count,
+                    f"Sequence number range should match row count. "
+                    f"File: {blob_file.file_name}, row_count: {row_count}, "
+                    f"min_seq: {min_seq}, max_seq: {max_seq}, "
+                    f"expected range: {row_count}, actual range: {max_seq - min_seq + 1}"
+                )
+            else:
+                # For single row files, min_seq == max_seq is acceptable
+                self.assertEqual(
+                    min_seq, max_seq,
+                    f"Single row file should have min_seq == max_seq. "
+                    f"File: {blob_file.file_name}, min_seq: {min_seq}, max_seq: {max_seq}"
+                )
+
+        print("✅ Non-descriptor mode sequence number increment test passed")
+
+    def test_blob_stats_schema_with_custom_column_name(self):
+        from pypaimon import Schema
+
+        # Create schema with blob column using a custom name (not 'blob_data')
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('my_custom_blob', pa.large_binary())  # Custom blob column name
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true',
+            'data-evolution.enabled': 'true'
+        })
+
+        self.catalog.create_table('test_db.blob_custom_name_test', schema, False)
+        table = self.catalog.get_table('test_db.blob_custom_name_test')
+
+        # Write data
+        test_data = pa.Table.from_pydict({
+            'id': [1, 2, 3],
+            'name': ['Alice', 'Bob', 'Charlie'],
+            'my_custom_blob': [b'blob1', b'blob2', b'blob3']
+        }, schema=pa_schema)
+
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # Verify we have at least one blob file
+        self.assertGreater(len(blob_files), 0, "Should have at least one blob file")
+
+        # Verify that the stats schema uses the actual blob column name, not hardcoded 'blob_data'
+        for blob_file in blob_files:
+            value_stats = blob_file.value_stats
+            if value_stats is not None and value_stats.min_values is not None:
+                # Get the field names from the stats
+                # The stats should use 'my_custom_blob', not 'blob_data'
+                min_values = value_stats.min_values
+                if hasattr(min_values, 'fields') and len(min_values.fields) > 0:
+                    # Check if the field name matches the actual blob column name
+                    field_name = min_values.fields[0].name
+                    self.assertEqual(
+                        field_name, 'my_custom_blob',
+                        f"Blob stats field name should be 'my_custom_blob' (actual column name), "
+                        f"but got '{field_name}'. This indicates the field name was hardcoded "
+                        f"instead of using the blob_column parameter."
+                    )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(table.new_read_builder().new_scan().plan().splits())
+        self.assertEqual(result.num_rows, 3)
+        self.assertEqual(result.column('id').to_pylist(), [1, 2, 3])
+        self.assertEqual(result.column('name').to_pylist(), ['Alice', 'Bob', 'Charlie'])
+
+    def test_blob_file_name_format_with_shared_uuid_non_descriptor_mode(self):
+        import random
+        import re
+        from pypaimon import Schema
+
+        # Create schema with blob column (blob-as-descriptor=false)
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('name', pa.string()),
+            ('blob_data', pa.large_binary())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, options={
+            'row-tracking.enabled': 'true',
+            'data-evolution.enabled': 'true',
+            'blob-as-descriptor': 'false',  # Non-descriptor mode
+            'target-file-size': '1MB'  # Small target size to trigger multiple rollings
+        })
+
+        self.catalog.create_table('test_db.blob_file_name_test_non_desc', schema, False)
+        table = self.catalog.get_table('test_db.blob_file_name_test_non_desc')
+
+        num_blobs, blob_size = 5, 2 * 1024 * 1024
+        random.seed(123)
+        blob_data_list = []
+        for i in range(num_blobs):
+            blob_data = bytes(bytearray([random.randint(0, 255) for _ in range(blob_size)]))
+            blob_data_list.append(blob_data)
+
+        # Write data in batches to trigger multiple file rollings
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+
+        # Write data that will trigger rolling
+        test_data = pa.Table.from_pydict({
+            'id': list(range(1, num_blobs + 1)),
+            'name': [f'item_{i}' for i in range(1, num_blobs + 1)],
+            'blob_data': blob_data_list
+        }, schema=pa_schema)
+
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        write_builder.new_commit().commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # Should have at least one blob file (may have multiple if rolling occurred)
+        self.assertGreaterEqual(len(blob_files), 1, "Should have at least one blob file")
+
+        # Verify file name format: data-{uuid}-{count}.blob
+        file_name_pattern = re.compile(
+            r'^data-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-'
+            r'[a-f0-9]{12}-(\d+)\.blob$'
+        )
+
+        first_file_name = blob_files[0].file_name
+        self.assertTrue(
+            file_name_pattern.match(first_file_name),
+            f"File name should match expected format: data-{{uuid}}-{{count}}.blob, got: {first_file_name}"
+        )
+
+        # Extract UUID and counter from first file name
+        first_match = file_name_pattern.match(first_file_name)
+        first_counter = int(first_match.group(1))
+
+        # Extract UUID (everything between "data-" and last "-")
+        uuid_start = len("data-")
+        uuid_end = first_file_name.rfind('-', uuid_start)
+        shared_uuid = first_file_name[uuid_start:uuid_end]
+
+        # Verify all blob files use the same UUID and have sequential counters
+        for i, blob_file in enumerate(blob_files):
+            file_name = blob_file.file_name
+            match = file_name_pattern.match(file_name)
+
+            self.assertIsNotNone(
+                match,
+                f"File name should match expected format: data-{{uuid}}-{{count}}.blob, got: {file_name}"
+            )
+
+            counter = int(match.group(1))
+
+            # Extract UUID from this file
+            file_uuid = file_name[uuid_start:file_name.rfind('-', uuid_start)]
+
+            self.assertEqual(
+                file_uuid,
+                shared_uuid,
+                f"All blob files should use the same UUID. Expected: {shared_uuid}, got: {file_uuid} in {file_name}"
+            )
+
+            self.assertEqual(
+                counter,
+                first_counter + i,
+                f"File counter should be sequential. Expected: {first_counter + i}, got: {counter} in {file_name}"
+            )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(table.new_read_builder().new_scan().plan().splits())
+        self.assertEqual(result.num_rows, num_blobs)
+        self.assertEqual(result.column('id').to_pylist(), list(range(1, num_blobs + 1)))
+
+    def test_blob_non_descriptor_target_file_size_rolling(self):
+        """Test that blob.target-file-size is respected in non-descriptor mode."""
+        from pypaimon import Schema
+
+        # Create schema with blob column (non-descriptor mode)
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('blob_data', pa.large_binary()),
+        ])
+
+        # Test with blob.target-file-size set to a small value
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob.target-file-size': '1MB'  # Set blob-specific target file size
+            }
+        )
+
+        self.catalog.create_table('test_db.blob_non_descriptor_rolling', schema, False)
+        table = self.catalog.get_table('test_db.blob_non_descriptor_rolling')
+
+        # Write multiple blobs that together exceed the target size
+        # Each blob is 0.6MB, so 3 blobs = 1.8MB > 1MB target
+        num_blobs = 3
+        blob_size = int(0.6 * 1024 * 1024)  # 0.6MB per blob
+
+        test_data = pa.Table.from_pydict({
+            'id': list(range(1, num_blobs + 1)),
+            'blob_data': [b'x' * blob_size for _ in range(num_blobs)]
+        }, schema=pa_schema)
+
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Extract blob files from commit messages
+        all_files = [f for msg in commit_messages for f in msg.new_files]
+        blob_files = [f for f in all_files if f.file_name.endswith('.blob')]
+
+        # The key test: verify that blob.target-file-size is used instead of target-file-size
+        # If target-file-size (default 256MB for append-only) was used, we'd have 1 file
+        # If blob.target-file-size (1MB) is used, we should have multiple files
+        total_data_size = num_blobs * blob_size
+
+        # Verify that the rolling logic used blob_target_file_size (1MB) not target_file_size (256MB)
+        # If target_file_size was used, all data would fit in one file
+        # If blob_target_file_size was used, data should be split
+        if total_data_size > 1024 * 1024:  # Total > 1MB
+            self.assertGreater(
+                len(blob_files), 1,
+                f"Should have multiple blob files when using blob.target-file-size (1MB). "
+                f"Total data size: {total_data_size / 1024 / 1024:.2f}MB, "
+                f"got {len(blob_files)} file(s). "
+                f"This indicates blob.target-file-size was ignored and target-file-size was used instead."
+            )
+
+        # Verify data integrity
+        result = table.new_read_builder().new_read().to_arrow(
+            table.new_read_builder().new_scan().plan().splits()
+        )
+        self.assertEqual(result.num_rows, num_blobs)
+        self.assertEqual(result.column('id').to_pylist(), list(range(1, num_blobs + 1)))
+
+    def test_blob_write_read_large_data_with_rolling_with_shard(self):
+        """
+        Test writing and reading large blob data with file rolling and sharding.
+
+        Test workflow:
+        - Creates a table with blob column and 10MB target file size
+        - Writes 4 batches of 40 records each (160 total records)
+        - Each record contains a 3MB blob
+        - Reads data using 3-way sharding (shard 0 - 3)
+        - Verifies blob data integrity and size
+        - Compares concatenated sharded results with full table scan
+        """
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('record_id_of_batch', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob.target-file-size': '10MB'
+            }
+        )
+        self.catalog.create_table('test_db.blob_rolling_with_shard', schema, False)
+        table = self.catalog.get_table('test_db.blob_rolling_with_shard')
+
+        # Create large blob data
+        large_blob_size = 3 * 1024 * 1024
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        actual_size = len(large_blob_data)
+        print(f"Created blob data: {actual_size:,} bytes ({actual_size / (1024 * 1024):.2f} MB)")
+        # Write 4 batches of 40 records
+        for i in range(4):
+            write_builder = table.new_batch_write_builder()
+            writer = write_builder.new_write()
+            # Write 40 records
+            for record_id in range(40):
+                test_data = pa.Table.from_pydict({
+                    'id': [i * 40 + record_id + 1],  # Unique ID for each row
+                    'record_id_of_batch': [record_id],
+                    'metadata': [f'Large blob batch {record_id + 1}'],
+                    'large_blob': [large_blob_data]
+                }, schema=pa_schema)
+                writer.write_arrow(test_data)
+
+            commit_messages = writer.prepare_commit()
+            commit = write_builder.new_commit()
+            commit.commit(commit_messages)
+            writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan().with_shard(0, 3)
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify the data
+        self.assertEqual(result.num_rows, 54, "Should have 54 rows")
+        self.assertEqual(result.num_columns, 4, "Should have 4 columns")
+
+        # Verify blob data integrity
+        blob_data = result.column('large_blob').to_pylist()
+        self.assertEqual(len(blob_data), 54, "Should have 54 blob records")
+        # Verify each blob
+        for i, blob in enumerate(blob_data):
+            self.assertEqual(len(blob), len(large_blob_data), f"Blob {i + 1} should be {large_blob_size:,} bytes")
+            self.assertEqual(blob, large_blob_data, f"Blob {i + 1} content should match exactly")
+        splits = read_builder.new_scan().plan().splits()
+        expected = table_read.to_arrow(splits)
+        splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+        actual1 = table_read.to_arrow(splits1)
+        splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+        actual2 = table_read.to_arrow(splits2)
+        splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+        actual3 = table_read.to_arrow(splits3)
+        actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
+
+        # Verify the data
+        self.assertEqual(actual.num_rows, 160, "Should have 160 rows")
+        self.assertEqual(actual.num_columns, 4, "Should have 4 columns")
+        self.assertEqual(actual.column('id').to_pylist(), list(range(1, 161)), "ID column should match")
+        self.assertEqual(actual, expected)
+
+    def test_blob_rolling_with_shard(self):
+        """
+        - Writes 30 records
+        - Each record contains a 3MB blob
+        """
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob.target-file-size': '10MB'
+            }
+        )
+        self.catalog.create_table('test_db.blob_rolling_with_shard1', schema, False)
+        table = self.catalog.get_table('test_db.blob_rolling_with_shard1')
+
+        # Create large blob data
+        large_blob_size = 3 * 1024 * 1024  #
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        actual_size = len(large_blob_data)
+        print(f"Created blob data: {actual_size:,} bytes ({actual_size / (1024 * 1024):.2f} MB)")
+
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        # Write 30 records
+        for record_id in range(30):
+            test_data = pa.Table.from_pydict({
+                'id': [record_id],  # Unique ID for each row
+                'metadata': [f'Large blob batch {record_id + 1}'],
+                'large_blob': [struct.pack('<I', record_id) + large_blob_data]
+            }, schema=pa_schema)
+            writer.write_arrow(test_data)
+
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan().with_shard(1, 3)
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify the data
+        self.assertEqual(result.num_rows, 10, "Should have 10 rows")
+        self.assertEqual(result.num_columns, 3, "Should have 3 columns")
+
+        # Verify blob data integrity
+        blob_data = result.column('large_blob').to_pylist()
+        self.assertEqual(len(blob_data), 10, "Should have 94 blob records")
+        # Verify each blob
+        for i, blob in enumerate(blob_data):
+            self.assertEqual(len(blob), len(large_blob_data) + 4, f"Blob {i + 1} should be {large_blob_size:,} bytes")
+        splits = read_builder.new_scan().plan().splits()
+        expected = table_read.to_arrow(splits)
+        splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+        actual1 = table_read.to_arrow(splits1)
+        splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+        actual2 = table_read.to_arrow(splits2)
+        splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+        actual3 = table_read.to_arrow(splits3)
+        actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
+
+        # Verify the data
+        self.assertEqual(actual.num_rows, 30, "Should have 30 rows")
+        self.assertEqual(actual.num_columns, 3, "Should have 3 columns")
+        self.assertEqual(actual, expected)
+
+    def test_blob_large_data_volume_with_shard(self):
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('batch_id', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true'
+            }
+        )
+        self.catalog.create_table('test_db.blob_large_data_volume_with_shard', schema, False)
+        table = self.catalog.get_table('test_db.blob_large_data_volume_with_shard')
+
+        large_blob_size = 5 * 1024
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        num_row = 20000
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        expected = pa.Table.from_pydict({
+            'id': [1] * num_row,
+            'batch_id': [11] * num_row,
+            'metadata': [f'Large blob batch {11}'] * num_row,
+            'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
+        }, schema=pa_schema)
+        writer.write_arrow(expected)
+
+        # Commit all data at once
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan().with_shard(2, 3)
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify the data
+        self.assertEqual(6666, result.num_rows)
+        self.assertEqual(4, result.num_columns)
+
+        self.assertEqual(expected.slice(13334, 6666), result)
+        splits = read_builder.new_scan().plan().splits()
+        expected = table_read.to_arrow(splits)
+        splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+        actual1 = table_read.to_arrow(splits1)
+        splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+        actual2 = table_read.to_arrow(splits2)
+        splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+        actual3 = table_read.to_arrow(splits3)
+        actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
+        self.assertEqual(actual, expected)
+
+    def test_data_blob_writer_with_shard(self):
+        """Test DataBlobWriter with mixed data types in blob column."""
+
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('type', pa.string()),
+            ('data', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true'
+            }
+        )
+        self.catalog.create_table('test_db.with_shard_test', schema, False)
+        table = self.catalog.get_table('test_db.with_shard_test')
+
+        # Use proper table API to create writer
+        write_builder = table.new_batch_write_builder()
+        blob_writer = write_builder.new_write()
+
+        # Test data with different types of blob content
+        test_data = pa.Table.from_pydict({
+            'id': [1, 2, 3, 4, 5],
+            'type': ['text', 'json', 'binary', 'image', 'pdf'],
+            'data': [
+                b'This is text content',
+                b'{"key": "value", "number": 42}',
+                b'\x00\x01\x02\x03\xff\xfe\xfd',
+                b'PNG_IMAGE_DATA_PLACEHOLDER',
+                b'%PDF-1.4\nPDF_CONTENT_PLACEHOLDER'
+            ]
+        }, schema=pa_schema)
+
+        # Write mixed data
+        total_rows = 0
+        for batch in test_data.to_batches():
+            blob_writer.write_arrow_batch(batch)
+            total_rows += batch.num_rows
+
+        # Test prepare commit
+        commit_messages = blob_writer.prepare_commit()
+        # Create commit and commit the data
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        blob_writer.close()
+
+        # Read data back using table API
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan().with_shard(1, 2)
+        table_read = read_builder.new_read()
+        splits = table_scan.plan().splits()
+        result = table_read.to_arrow(splits)
+
+        # Verify the data was read back correctly
+        self.assertEqual(result.num_rows, 2, "Should have 2 rows")
+        self.assertEqual(result.num_columns, 3, "Should have 3 columns")
+
+    def test_blob_write_read_large_data_volume_rolling_with_shard(self):
+        """
+        - Writes 10000 records
+        - Each record contains a 5KB blob
+        - 'blob.target-file-size': '10MB'
+        - each blob file contains 2000 records
+        """
+        # Create schema with blob column
+        pa_schema = pa.schema([
+            ('id', pa.int32()),
+            ('batch_id', pa.int32()),
+            ('metadata', pa.string()),
+            ('large_blob', pa.large_binary()),
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob.target-file-size': '10MB'
+            }
+        )
+        self.catalog.create_table('test_db.test_blob_write_read_large_data_volume_rolling_with_shard', schema, False)
+        table = self.catalog.get_table('test_db.test_blob_write_read_large_data_volume_rolling_with_shard')
+
+        # Create large blob data
+        large_blob_size = 5 * 1024  #
+        blob_pattern = b'LARGE_BLOB_PATTERN_' + b'X' * 1024  # ~1KB pattern
+        pattern_size = len(blob_pattern)
+        repetitions = large_blob_size // pattern_size
+        large_blob_data = blob_pattern * repetitions
+
+        actual_size = len(large_blob_data)
+        print(f"Created blob data: {actual_size:,} bytes ({actual_size / (1024 * 1024):.2f} MB)")
+        # Write 10000 records of data
+        num_row = 10000
+        expected = pa.Table.from_pydict({
+            'id': [1] * num_row,
+            'batch_id': [11] * num_row,
+            'metadata': [f'Large blob batch {11}'] * num_row,
+            'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
+        }, schema=pa_schema)
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(expected)
+
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        # Read data back
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+        self.assertEqual(expected, result)
+
+        splits = read_builder.new_scan().plan().splits()
+        expected = table_read.to_arrow(splits)
+        splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+        actual1 = table_read.to_arrow(splits1)
+        splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+        actual2 = table_read.to_arrow(splits2)
+        splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+        actual3 = table_read.to_arrow(splits3)
+        actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
+
+        self.assertEqual(actual, expected)
 
 
 if __name__ == '__main__':

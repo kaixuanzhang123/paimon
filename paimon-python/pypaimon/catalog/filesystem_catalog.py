@@ -16,9 +16,7 @@
 # limitations under the License.
 #################################################################################
 
-from pathlib import Path
 from typing import List, Optional, Union
-from urllib.parse import urlparse
 
 from pypaimon.catalog.catalog import Catalog
 from pypaimon.catalog.catalog_environment import CatalogEnvironment
@@ -27,8 +25,9 @@ from pypaimon.catalog.catalog_exception import (DatabaseAlreadyExistException,
                                                 TableAlreadyExistException,
                                                 TableNotExistException)
 from pypaimon.catalog.database import Database
-from pypaimon.common.config import CatalogOptions
-from pypaimon.common.core_options import CoreOptions
+from pypaimon.common.options import Options
+from pypaimon.common.options.config import CatalogOptions
+from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.identifier import Identifier
 from pypaimon.schema.schema_manager import SchemaManager
@@ -39,9 +38,9 @@ from pypaimon.table.table import Table
 
 
 class FileSystemCatalog(Catalog):
-    def __init__(self, catalog_options: dict):
-        if CatalogOptions.WAREHOUSE not in catalog_options:
-            raise ValueError(f"Paimon '{CatalogOptions.WAREHOUSE}' path must be set")
+    def __init__(self, catalog_options: Options):
+        if not catalog_options.contains(CatalogOptions.WAREHOUSE):
+            raise ValueError(f"Paimon '{CatalogOptions.WAREHOUSE.key()}' path must be set")
         self.warehouse = catalog_options.get(CatalogOptions.WAREHOUSE)
         self.catalog_options = catalog_options
         self.file_io = FileIO(self.warehouse, self.catalog_options)
@@ -66,7 +65,7 @@ class FileSystemCatalog(Catalog):
     def get_table(self, identifier: Union[str, Identifier]) -> Table:
         if not isinstance(identifier, Identifier):
             identifier = Identifier.from_string(identifier)
-        if CoreOptions.SCAN_FALLBACK_BRANCH in self.catalog_options:
+        if self.catalog_options.contains(CoreOptions.SCAN_FALLBACK_BRANCH):
             raise ValueError(f"Unsupported CoreOption {CoreOptions.SCAN_FALLBACK_BRANCH}")
         table_path = self.get_table_path(identifier)
         table_schema = self.get_table_schema(identifier)
@@ -83,8 +82,8 @@ class FileSystemCatalog(Catalog):
         return FileStoreTable(self.file_io, identifier, table_path, table_schema, catalog_environment)
 
     def create_table(self, identifier: Union[str, Identifier], schema: 'Schema', ignore_if_exists: bool):
-        if schema.options and schema.options.get(CoreOptions.AUTO_CREATE):
-            raise ValueError(f"The value of {CoreOptions.AUTO_CREATE} property should be False.")
+        if schema.options and schema.options.get(CoreOptions.AUTO_CREATE.key()):
+            raise ValueError(f"The value of {CoreOptions.AUTO_CREATE.key()} property should be False.")
 
         if not isinstance(identifier, Identifier):
             identifier = Identifier.from_string(identifier)
@@ -94,9 +93,9 @@ class FileSystemCatalog(Catalog):
             if not ignore_if_exists:
                 raise TableAlreadyExistException(identifier)
         except TableNotExistException:
-            if schema.options and CoreOptions.TYPE in schema.options and schema.options.get(
-                    CoreOptions.TYPE) != "table":
-                raise ValueError(f"Table Type {schema.options.get(CoreOptions.TYPE)}")
+            if schema.options and CoreOptions.TYPE.key() in schema.options and schema.options.get(
+                    CoreOptions.TYPE.key()) != "table":
+                raise ValueError(f"Table Type: {schema.options.get(CoreOptions.TYPE.key())}")
             table_path = self.get_table_path(identifier)
             schema_manager = SchemaManager(self.file_io, table_path)
             schema_manager.create_table(schema)
@@ -108,18 +107,13 @@ class FileSystemCatalog(Catalog):
             raise TableNotExistException(identifier)
         return table_schema
 
-    def get_database_path(self, name) -> Path:
-        return self._trim_schema(self.warehouse) / f"{name}{Catalog.DB_SUFFIX}"
+    def get_database_path(self, name) -> str:
+        warehouse = self.warehouse.rstrip('/')
+        return f"{warehouse}/{name}{Catalog.DB_SUFFIX}"
 
-    def get_table_path(self, identifier: Identifier) -> Path:
-        return self.get_database_path(identifier.get_database_name()) / identifier.get_table_name()
-
-    @staticmethod
-    def _trim_schema(warehouse_url: str) -> Path:
-        parsed = urlparse(warehouse_url)
-        bucket = parsed.netloc
-        warehouse_dir = parsed.path.lstrip('/')
-        return Path(f"{bucket}/{warehouse_dir}" if warehouse_dir else bucket)
+    def get_table_path(self, identifier: Identifier) -> str:
+        db_path = self.get_database_path(identifier.get_database_name())
+        return f"{db_path}/{identifier.get_table_name()}"
 
     def commit_snapshot(
             self,

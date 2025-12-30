@@ -140,6 +140,8 @@ public class ManifestListTest {
                             null,
                             null,
                             null,
+                            null,
+                            null,
                             null));
         }
         return result;
@@ -173,6 +175,7 @@ public class ManifestListTest {
                 CoreOptions.FILE_COMPRESSION.defaultValue(),
                 null,
                 null,
+                CoreOptions.ExternalPathStrategy.NONE,
                 false);
     }
 

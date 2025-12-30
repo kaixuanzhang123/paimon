@@ -199,12 +199,12 @@ public class TextFileReaderTest {
     }
 
     /** Concrete implementation of BaseTextFileReader for testing. */
-    private static class TestTextFileReader extends TextFileReader {
+    private static class TestTextFileReader extends AbstractTextFileReader {
 
         public TestTextFileReader(
                 FileIO fileIO, Path filePath, RowType rowType, String recordDelimiter)
                 throws IOException {
-            super(fileIO, filePath, rowType, recordDelimiter);
+            super(fileIO, filePath, rowType, recordDelimiter, 0, null);
         }
 
         @Nullable

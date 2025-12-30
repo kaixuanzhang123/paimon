@@ -18,15 +18,15 @@
 
 import io
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import urlparse, ParseResult
 
 import requests
 from cachetools import LRUCache
 from readerwriterlock import rwlock
 
-from pypaimon.common.config import CatalogOptions
+from pypaimon.common.options import Options
+from pypaimon.common.options.config import CatalogOptions
 
 
 class UriReader(ABC):
@@ -42,12 +42,11 @@ class UriReader(ABC):
     def get_file_path(cls, uri: str):
         parsed_uri = urlparse(uri)
         if parsed_uri.scheme == 'file':
-            path = Path(parsed_uri.path)
+            return parsed_uri.path
         elif parsed_uri.scheme and parsed_uri.scheme != '':
-            path = Path(parsed_uri.netloc + parsed_uri.path)
+            return f"{parsed_uri.netloc}{parsed_uri.path}"
         else:
-            path = Path(uri)
-        return path
+            return uri
 
     @abstractmethod
     def new_input_stream(self, uri: str):
@@ -61,8 +60,7 @@ class FileUriReader(UriReader):
 
     def new_input_stream(self, uri: str):
         try:
-            path = self.get_file_path(uri)
-            return self._file_io.new_input_stream(path)
+            return self._file_io.new_input_stream(uri)
         except Exception as e:
             raise IOError(f"Failed to read file {uri}: {e}")
 
@@ -110,8 +108,8 @@ class UriKey:
 
 class UriReaderFactory:
 
-    def __init__(self, catalog_options: dict) -> None:
-        self.catalog_options = catalog_options
+    def __init__(self, catalog_options: Union[Options, dict]) -> None:
+        self.catalog_options = catalog_options if isinstance(catalog_options, Options) else Options(catalog_options)
         self._readers = LRUCache(CatalogOptions.BLOB_FILE_IO_DEFAULT_CACHE_SIZE)
         self._readers_lock = rwlock.RWLockFair()
 

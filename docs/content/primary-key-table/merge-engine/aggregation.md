@@ -100,6 +100,7 @@ Current supported aggregate functions and data types are:
   The listagg function concatenates multiple string values into a single string.
   It supports STRING data type.
   Each field not part of the primary keys can be given a list agg delimiter, specified by the fields.<field-name>.list-agg-delimiter table property, otherwise it will use "," as default.
+  You can use `fields.<field-name>.distinct=true` to deduplicate values split by the `fields.<field-name>.list-agg-delimiter`.
 
 ### bool_and
   The bool_and function evaluates whether all values in a boolean set are true.
@@ -374,6 +375,11 @@ public static class BitmapContainsUDF extends ScalarFunction {
   {{< /tab >}}
 
   {{< /tabs >}}
+
+### nested_partial_update
+  The nested_partial_update function collects multiple rows into one array<row> (so-called 'nested table'). It supports
+  ARRAY<ROW> data types. You need to use `fields.<field-name>.nested-key=pk0,pk1,...` to specify the primary keys of the
+  nested table. The values in each row are written by partial updating some columns.
 
 ### collect
   The collect function collects elements into an Array. You can set `fields.<field-name>.distinct=true` to deduplicate elements.

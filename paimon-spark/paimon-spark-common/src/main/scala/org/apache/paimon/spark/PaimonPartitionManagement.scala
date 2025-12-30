@@ -50,7 +50,8 @@ trait PaimonPartitionManagement extends SupportsAtomicPartitionManagement {
           fileStoreTable.coreOptions().partitionDefaultName(),
           partitionRowType,
           table.partitionKeys().asScala.toArray,
-          CoreOptions.fromMap(table.options()).legacyPartitionName)
+          CoreOptions.fromMap(table.options()).legacyPartitionName
+        )
 
         rows.map {
           r =>
@@ -86,6 +87,21 @@ trait PaimonPartitionManagement extends SupportsAtomicPartitionManagement {
       case _ =>
         throw new UnsupportedOperationException("Only FileStoreTable supports drop partitions.")
     }
+  }
+
+  override def truncatePartitions(idents: Array[InternalRow]): Boolean = {
+    val partitions = toPaimonPartitions(idents).toSeq.asJava
+    val commit = table.newBatchWriteBuilder().newCommit()
+    try {
+      commit.truncatePartitions(partitions)
+    } finally {
+      commit.close()
+    }
+    true
+  }
+
+  override def truncatePartition(ident: InternalRow): Boolean = {
+    truncatePartitions(Array(ident))
   }
 
   override def replacePartitionMetadata(

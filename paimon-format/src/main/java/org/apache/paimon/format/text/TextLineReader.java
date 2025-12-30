@@ -18,6 +18,8 @@
 
 package org.apache.paimon.format.text;
 
+import javax.annotation.Nullable;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -26,17 +28,27 @@ import java.nio.charset.StandardCharsets;
 /** Reader to read lines. */
 public interface TextLineReader extends Closeable {
 
+    @Nullable
     String readLine() throws IOException;
 
-    static TextLineReader create(InputStream inputStream, String delimiter) {
-        byte[] delimiterBytes =
-                delimiter != null && !"\n".equals(delimiter)
-                        ? delimiter.getBytes(StandardCharsets.UTF_8)
-                        : null;
-        if (delimiterBytes == null || delimiterBytes.length == 0) {
-            return new StandardLineReader(inputStream);
+    static TextLineReader create(
+            InputStream inputStream, String delimiter, long offset, @Nullable Long length)
+            throws IOException {
+        if (isDefaultDelimiter(delimiter)) {
+            return new StandardLineReader(inputStream, offset, length);
         } else {
-            return new CustomLineReader(inputStream, delimiterBytes);
+            if (offset != 0 || length != null) {
+                throw new UnsupportedOperationException(
+                        "Custom line text file does not support offset and length.");
+            }
+            return new CustomLineReader(inputStream, delimiter.getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    static boolean isDefaultDelimiter(String delimiter) {
+        return delimiter == null
+                || "\n".equals(delimiter)
+                || "\r\n".equals(delimiter)
+                || "\r".equals(delimiter);
     }
 }

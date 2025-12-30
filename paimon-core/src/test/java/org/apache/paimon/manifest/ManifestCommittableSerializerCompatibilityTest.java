@@ -20,6 +20,7 @@ package org.apache.paimon.manifest;
 
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.index.DeletionVectorMeta;
+import org.apache.paimon.index.GlobalIndexMeta;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataFileMeta;
@@ -43,6 +44,204 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Compatibility Test for {@link ManifestCommittableSerializer}. */
 public class ManifestCommittableSerializerCompatibilityTest {
+
+    @Test
+    public void testCompatibilityToV5CommitV11() throws IOException {
+        String fileName = "manifest-committable-v11-v5";
+
+        SimpleStats keyStats =
+                new SimpleStats(
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        fromLongArray(new Long[] {0L}));
+        SimpleStats valueStats =
+                new SimpleStats(
+                        singleColumn("min_value"),
+                        singleColumn("max_value"),
+                        fromLongArray(new Long[] {0L}));
+        DataFileMeta dataFile =
+                DataFileMeta.create(
+                        "my_file",
+                        1024 * 1024,
+                        1024,
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        keyStats,
+                        valueStats,
+                        15,
+                        200,
+                        5,
+                        3,
+                        Arrays.asList("extra1", "extra2"),
+                        Timestamp.fromLocalDateTime(LocalDateTime.parse("2022-03-02T20:20:12")),
+                        11L,
+                        new byte[] {1, 2, 4},
+                        FileSource.COMPACT,
+                        Arrays.asList("field1", "field2", "field3"),
+                        "hdfs://localhost:9000/path/to/file",
+                        1L,
+                        Arrays.asList("asdf", "qwer", "zxcv"));
+        List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
+        GlobalIndexMeta globalIndexMeta =
+                new GlobalIndexMeta(1L, 2L, 3, new int[] {5, 6, 7}, new byte[] {0x23, 0x45});
+        IndexFileMeta hashIndexFile =
+                new IndexFileMeta(
+                        "my_index_type",
+                        "my_index_file",
+                        1024 * 100,
+                        1002,
+                        null,
+                        null,
+                        globalIndexMeta);
+
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        IndexFileMeta devIndexFile =
+                new IndexFileMeta(
+                        "my_index_type",
+                        "my_index_file",
+                        1024 * 100,
+                        1002,
+                        dvRanges,
+                        "external_path");
+
+        CommitMessageImpl commitMessage =
+                new CommitMessageImpl(
+                        singleColumn("my_partition"),
+                        11,
+                        16,
+                        new DataIncrement(
+                                dataFiles,
+                                dataFiles,
+                                dataFiles,
+                                Collections.singletonList(hashIndexFile),
+                                Collections.singletonList(hashIndexFile)),
+                        new CompactIncrement(
+                                dataFiles,
+                                dataFiles,
+                                dataFiles,
+                                Collections.singletonList(devIndexFile),
+                                Collections.emptyList()));
+
+        ManifestCommittable manifestCommittable =
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
+        manifestCommittable.addProperty("k1", "v1");
+        manifestCommittable.addProperty("k2", "v2");
+
+        ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
+        byte[] bytes = serializer.serialize(manifestCommittable);
+        ManifestCommittable deserialized = serializer.deserialize(serializer.getVersion(), bytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+
+        byte[] oldBytes =
+                IOUtils.readFully(
+                        ManifestCommittableSerializerCompatibilityTest.class
+                                .getClassLoader()
+                                .getResourceAsStream("compatibility/" + fileName),
+                        true);
+        deserialized = serializer.deserialize(5, oldBytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+    }
+
+    @Test
+    public void testCompatibilityToV4CommitV11() throws IOException {
+        String fileName = "manifest-committable-v11";
+
+        SimpleStats keyStats =
+                new SimpleStats(
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        fromLongArray(new Long[] {0L}));
+        SimpleStats valueStats =
+                new SimpleStats(
+                        singleColumn("min_value"),
+                        singleColumn("max_value"),
+                        fromLongArray(new Long[] {0L}));
+        DataFileMeta dataFile =
+                DataFileMeta.create(
+                        "my_file",
+                        1024 * 1024,
+                        1024,
+                        singleColumn("min_key"),
+                        singleColumn("max_key"),
+                        keyStats,
+                        valueStats,
+                        15,
+                        200,
+                        5,
+                        3,
+                        Arrays.asList("extra1", "extra2"),
+                        Timestamp.fromLocalDateTime(LocalDateTime.parse("2022-03-02T20:20:12")),
+                        11L,
+                        new byte[] {1, 2, 4},
+                        FileSource.COMPACT,
+                        Arrays.asList("field1", "field2", "field3"),
+                        "hdfs://localhost:9000/path/to/file",
+                        1L,
+                        Arrays.asList("asdf", "qwer", "zxcv"));
+        List<DataFileMeta> dataFiles = Collections.singletonList(dataFile);
+        GlobalIndexMeta globalIndexMeta =
+                new GlobalIndexMeta(1L, 2L, 3, new int[] {5, 6, 7}, new byte[] {0x23, 0x45});
+        IndexFileMeta hashIndexFile =
+                new IndexFileMeta(
+                        "my_index_type",
+                        "my_index_file",
+                        1024 * 100,
+                        1002,
+                        null,
+                        null,
+                        globalIndexMeta);
+
+        LinkedHashMap<String, DeletionVectorMeta> dvRanges = new LinkedHashMap<>();
+        dvRanges.put("dv_key1", new DeletionVectorMeta("dv_key1", 1, 2, 3L));
+        dvRanges.put("dv_key2", new DeletionVectorMeta("dv_key2", 3, 4, 5L));
+        IndexFileMeta devIndexFile =
+                new IndexFileMeta(
+                        "my_index_type",
+                        "my_index_file",
+                        1024 * 100,
+                        1002,
+                        dvRanges,
+                        "external_path");
+
+        CommitMessageImpl commitMessage =
+                new CommitMessageImpl(
+                        singleColumn("my_partition"),
+                        11,
+                        16,
+                        new DataIncrement(
+                                dataFiles,
+                                dataFiles,
+                                dataFiles,
+                                Collections.singletonList(hashIndexFile),
+                                Collections.singletonList(hashIndexFile)),
+                        new CompactIncrement(
+                                dataFiles,
+                                dataFiles,
+                                dataFiles,
+                                Collections.singletonList(devIndexFile),
+                                Collections.emptyList()));
+
+        ManifestCommittable manifestCommittable =
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
+        manifestCommittable.addProperty("k1", "v1");
+        manifestCommittable.addProperty("k2", "v2");
+
+        ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
+        byte[] bytes = serializer.serialize(manifestCommittable);
+        ManifestCommittable deserialized = serializer.deserialize(serializer.getVersion(), bytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+
+        byte[] oldBytes =
+                IOUtils.readFully(
+                        ManifestCommittableSerializerCompatibilityTest.class
+                                .getClassLoader()
+                                .getResourceAsStream("compatibility/" + fileName),
+                        true);
+        deserialized = serializer.deserialize(4, oldBytes);
+        assertThat(deserialized).isEqualTo(manifestCommittable);
+    }
 
     @Test
     public void testCompatibilityToV4CommitV10() throws IOException {
@@ -115,11 +314,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
         manifestCommittable.addProperty("k1", "v1");
         manifestCommittable.addProperty("k2", "v2");
 
@@ -201,11 +396,8 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
+
         manifestCommittable.addProperty("k1", "v1");
         manifestCommittable.addProperty("k2", "v2");
 
@@ -283,11 +475,8 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
+
         manifestCommittable.addProperty("k1", "v1");
         manifestCommittable.addProperty("k2", "v2");
 
@@ -365,11 +554,8 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
+
         manifestCommittable.addProperty("k1", "v1");
         manifestCommittable.addProperty("k2", "v2");
 
@@ -446,11 +632,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -525,11 +707,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -604,11 +782,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -682,11 +856,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -761,11 +931,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -840,11 +1006,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);
@@ -915,11 +1077,7 @@ public class ManifestCommittableSerializerCompatibilityTest {
                                 Collections.emptyList()));
 
         ManifestCommittable manifestCommittable =
-                new ManifestCommittable(
-                        5,
-                        202020L,
-                        Collections.singletonMap(5, 555L),
-                        Collections.singletonList(commitMessage));
+                new ManifestCommittable(5, 202020L, Collections.singletonList(commitMessage));
 
         ManifestCommittableSerializer serializer = new ManifestCommittableSerializer();
         byte[] bytes = serializer.serialize(manifestCommittable);

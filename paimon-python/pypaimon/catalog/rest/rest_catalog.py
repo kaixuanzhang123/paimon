@@ -15,15 +15,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
-from urllib.parse import urlparse
-
-import pyarrow
-from packaging.version import parse
 
 from pypaimon.api.api_response import GetTableResponse, PagedList
-from pypaimon.api.options import Options
 from pypaimon.api.rest_api import RESTApi
 from pypaimon.api.rest_exception import NoSuchResourceException, AlreadyExistsException
 from pypaimon.catalog.catalog import Catalog
@@ -35,8 +29,8 @@ from pypaimon.catalog.database import Database
 from pypaimon.catalog.rest.property_change import PropertyChange
 from pypaimon.catalog.rest.rest_token_file_io import RESTTokenFileIO
 from pypaimon.catalog.rest.table_metadata import TableMetadata
-from pypaimon.common.config import CatalogOptions
-from pypaimon.common.core_options import CoreOptions
+from pypaimon.common.options.config import CatalogOptions
+from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.identifier import Identifier
 from pypaimon.schema.schema import Schema
@@ -49,8 +43,8 @@ from pypaimon.table.file_store_table import FileStoreTable
 class RESTCatalog(Catalog):
     def __init__(self, context: CatalogContext, config_required: Optional[bool] = True):
         self.warehouse = context.options.get(CatalogOptions.WAREHOUSE)
-        self.rest_api = RESTApi(context.options.to_map(), config_required)
-        self.context = CatalogContext.create(Options(self.rest_api.options), context.hadoop_conf,
+        self.rest_api = RESTApi(context.options, config_required)
+        self.context = CatalogContext.create(self.rest_api.options, context.hadoop_conf,
                                              context.prefer_io_loader, context.fallback_io_loader)
         self.data_token_enabled = self.rest_api.options.get(CatalogOptions.DATA_TOKEN_ENABLED)
 
@@ -126,11 +120,11 @@ class RESTCatalog(Catalog):
         if response is not None:
             return Database(name, options)
 
-    def drop_database(self, name: str, ignore_if_exists: bool = False):
+    def drop_database(self, name: str, ignore_if_not_exists: bool = False):
         try:
             self.rest_api.drop_database(name)
         except NoSuchResourceException as e:
-            if not ignore_if_exists:
+            if not ignore_if_not_exists:
                 # Convert REST API exception to catalog exception
                 raise DatabaseNotExistException(name) from e
 
@@ -174,13 +168,13 @@ class RESTCatalog(Catalog):
             if not ignore_if_exists:
                 raise TableAlreadyExistException(identifier) from e
 
-    def drop_table(self, identifier: Union[str, Identifier], ignore_if_exists: bool = False):
+    def drop_table(self, identifier: Union[str, Identifier], ignore_if_not_exists: bool = False):
         if not isinstance(identifier, Identifier):
             identifier = Identifier.from_string(identifier)
         try:
             self.rest_api.drop_table(identifier)
         except NoSuchResourceException as e:
-            if not ignore_if_exists:
+            if not ignore_if_not_exists:
                 raise TableNotExistException(identifier) from e
 
     def load_table_metadata(self, identifier: Identifier) -> TableMetadata:
@@ -190,12 +184,12 @@ class RESTCatalog(Catalog):
     def to_table_metadata(self, db: str, response: GetTableResponse) -> TableMetadata:
         schema = TableSchema.from_schema(response.schema_id, response.get_schema())
         options: Dict[str, str] = dict(schema.options)
-        options[CoreOptions.PATH] = response.get_path()
+        options[CoreOptions.PATH.key()] = response.get_path()
         response.put_audit_options_to(options)
 
         identifier = Identifier.create(db, response.get_name())
         if identifier.get_branch_name() is not None:
-            options[CoreOptions.BRANCH] = identifier.get_branch_name()
+            options[CoreOptions.BRANCH.key()] = identifier.get_branch_name()
 
         return TableMetadata(
             schema=schema.copy(options),
@@ -204,10 +198,10 @@ class RESTCatalog(Catalog):
         )
 
     def file_io_from_options(self, table_path: str) -> FileIO:
-        return FileIO(table_path, self.context.options.data)
+        return FileIO(table_path, self.context.options)
 
     def file_io_for_data(self, table_path: str, identifier: Identifier):
-        return RESTTokenFileIO(identifier, table_path, self.context.options.data) \
+        return RESTTokenFileIO(identifier, table_path, self.context.options) \
             if self.data_token_enabled else self.file_io_from_options(table_path)
 
     def load_table(self,
@@ -225,22 +219,17 @@ class RESTCatalog(Catalog):
             catalog_loader=self.catalog_loader(),
             supports_version_management=True  # REST catalogs support version management
         )
-        path_parsed = urlparse(schema.options.get(CoreOptions.PATH))
-        path = path_parsed.path if path_parsed.scheme is None else schema.options.get(CoreOptions.PATH)
-        if path_parsed.scheme == "file":
-            table_path = path_parsed.path
-        else:
-            table_path = path_parsed.netloc + path_parsed.path \
-                if parse(pyarrow.__version__) >= parse("7.0.0") else path_parsed.path[1:]
-        table = self.create(data_file_io(path),
-                            Path(table_path),
+        # Use the path from server response directly (do not trim scheme)
+        table_path = schema.options.get(CoreOptions.PATH.key())
+        table = self.create(data_file_io(table_path),
+                            table_path,
                             schema,
                             catalog_env)
         return table
 
     @staticmethod
     def create(file_io: FileIO,
-               table_path: Path,
+               table_path: str,
                table_schema: TableSchema,
                catalog_environment: CatalogEnvironment
                ) -> FileStoreTable:

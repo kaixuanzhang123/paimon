@@ -19,13 +19,17 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.data.variant.VariantAccessInfo;
+import org.apache.paimon.data.variant.VariantAccessInfoUtils;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.predicate.VectorSearch;
 import org.apache.paimon.table.InnerTable;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.Range;
 
 import javax.annotation.Nullable;
 
@@ -60,7 +64,9 @@ public class ReadBuilderImpl implements ReadBuilder {
     private Filter<Integer> bucketFilter;
 
     private @Nullable RowType readType;
-    private @Nullable List<Long> indices;
+    private @Nullable VariantAccessInfo[] variantAccessInfo;
+    private @Nullable List<Range> rowRanges;
+    private @Nullable VectorSearch vectorSearch;
 
     private boolean dropStats = false;
 
@@ -77,11 +83,13 @@ public class ReadBuilderImpl implements ReadBuilder {
 
     @Override
     public RowType readType() {
-        if (readType != null) {
-            return readType;
-        } else {
-            return table.rowType();
+        RowType finalReadType = readType != null ? readType : table.rowType();
+        // When variantAccessInfo is not null, replace the variant with the actual readType.
+        if (variantAccessInfo != null) {
+            finalReadType =
+                    VariantAccessInfoUtils.buildReadRowType(finalReadType, variantAccessInfo);
         }
+        return finalReadType;
     }
 
     @Override
@@ -119,6 +127,12 @@ public class ReadBuilderImpl implements ReadBuilder {
     }
 
     @Override
+    public ReadBuilder withVariantAccess(VariantAccessInfo[] variantAccessInfo) {
+        this.variantAccessInfo = variantAccessInfo;
+        return this;
+    }
+
+    @Override
     public ReadBuilder withProjection(int[] projection) {
         if (projection == null) {
             return this;
@@ -146,8 +160,14 @@ public class ReadBuilderImpl implements ReadBuilder {
     }
 
     @Override
-    public ReadBuilder withRowIds(List<Long> indices) {
-        this.indices = indices;
+    public ReadBuilder withRowRanges(List<Range> indices) {
+        this.rowRanges = indices;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withVectorSearch(VectorSearch vectorSearch) {
+        this.vectorSearch = vectorSearch;
         return this;
     }
 
@@ -193,7 +213,9 @@ public class ReadBuilderImpl implements ReadBuilder {
         scan.withFilter(filter)
                 .withReadType(readType)
                 .withPartitionFilter(partitionFilter)
-                .withRowIds(indices);
+                .withRowRanges(rowRanges)
+                .withVectorSearch(vectorSearch);
+
         checkState(
                 bucketFilter == null || shardIndexOfThisSubtask == null,
                 "Bucket filter and shard configuration cannot be used together. "
@@ -231,8 +253,8 @@ public class ReadBuilderImpl implements ReadBuilder {
         if (limit != null) {
             read.withLimit(limit);
         }
-        if (indices != null) {
-            read.withRowIds(indices);
+        if (variantAccessInfo != null) {
+            read.withVariantAccess(variantAccessInfo);
         }
         return read;
     }

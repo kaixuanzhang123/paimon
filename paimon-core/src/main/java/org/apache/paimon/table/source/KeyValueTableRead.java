@@ -21,6 +21,7 @@ package org.apache.paimon.table.source;
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.operation.MergeFileSplitRead;
 import org.apache.paimon.operation.RawFileSplitRead;
@@ -57,6 +58,7 @@ public final class KeyValueTableRead extends AbstractDataTableRead {
     private IOManager ioManager = null;
     @Nullable private TopN topN = null;
     @Nullable private Integer limit = null;
+    @Nullable private VariantAccessInfo[] variantAccess = null;
 
     public KeyValueTableRead(
             Supplier<MergeFileSplitRead> mergeReadSupplier,
@@ -95,6 +97,9 @@ public final class KeyValueTableRead extends AbstractDataTableRead {
         if (limit != null) {
             read = read.withLimit(limit);
         }
+        if (variantAccess != null) {
+            read = read.withVariantAccess(variantAccess);
+        }
         read.withFilter(predicate).withIOManager(ioManager);
     }
 
@@ -105,8 +110,9 @@ public final class KeyValueTableRead extends AbstractDataTableRead {
     }
 
     @Override
-    public void applyRowIds(List<Long> indices) {
-        throw new UnsupportedOperationException("Does not support row ids.");
+    public void applyVariantAccess(VariantAccessInfo[] variantAccess) {
+        initialized().forEach(r -> r.withVariantAccess(variantAccess));
+        this.variantAccess = variantAccess;
     }
 
     @Override
@@ -146,10 +152,9 @@ public final class KeyValueTableRead extends AbstractDataTableRead {
 
     @Override
     public RecordReader<InternalRow> reader(Split split) throws IOException {
-        DataSplit dataSplit = (DataSplit) split;
         for (SplitReadProvider readProvider : readProviders) {
-            if (readProvider.match(dataSplit, forceKeepDelete)) {
-                return readProvider.get().get().createReader(dataSplit);
+            if (readProvider.match(split, new SplitReadProvider.Context(forceKeepDelete))) {
+                return readProvider.get().get().createReader(split);
             }
         }
 

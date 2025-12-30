@@ -31,7 +31,10 @@ import org.apache.paimon.reader.DataEvolutionRow;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.stats.SimpleStats;
+import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Range;
 import org.apache.paimon.utils.RangeHelper;
 import org.apache.paimon.utils.SnapshotManager;
 
@@ -46,12 +49,13 @@ import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.format.blob.BlobFileFormat.isBlobFile;
+import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
 /** {@link FileStoreScan} for data-evolution enabled table. */
 public class DataEvolutionFileStoreScan extends AppendOnlyFileStoreScan {
 
     private boolean dropStats = false;
-    @Nullable private List<Long> indices;
+    @Nullable private RowType readType;
 
     public DataEvolutionFileStoreScan(
             ManifestsReader manifestsReader,
@@ -60,7 +64,8 @@ public class DataEvolutionFileStoreScan extends AppendOnlyFileStoreScan {
             SchemaManager schemaManager,
             TableSchema schema,
             ManifestFile.Factory manifestFileFactory,
-            Integer scanManifestParallelism) {
+            Integer scanManifestParallelism,
+            boolean deletionVectorsEnabled) {
         super(
                 manifestsReader,
                 bucketSelectConverter,
@@ -69,37 +74,61 @@ public class DataEvolutionFileStoreScan extends AppendOnlyFileStoreScan {
                 schema,
                 manifestFileFactory,
                 scanManifestParallelism,
-                false);
+                false,
+                deletionVectorsEnabled);
     }
 
     @Override
     public FileStoreScan dropStats() {
+        // overwrite to keep stats here
+        // TODO refactor this hacky
         this.dropStats = true;
         return this;
     }
 
     @Override
     public FileStoreScan keepStats() {
+        // overwrite to keep stats here
+        // TODO refactor this hacky
         this.dropStats = false;
         return this;
     }
 
+    @Override
     public DataEvolutionFileStoreScan withFilter(Predicate predicate) {
+        // overwrite to keep all filter here
+        // TODO refactor this hacky
         this.inputFilter = predicate;
         return this;
     }
 
     @Override
-    public FileStoreScan withRowIds(List<Long> indices) {
-        this.indices = indices;
+    public FileStoreScan withReadType(RowType readType) {
+        if (readType != null) {
+            List<DataField> nonSystemFields =
+                    readType.getFields().stream()
+                            .filter(f -> !SpecialFields.isSystemField(f.id()))
+                            .collect(Collectors.toList());
+            if (!nonSystemFields.isEmpty()) {
+                this.readType = readType;
+            }
+        }
         return this;
     }
 
     @Override
-    protected List<ManifestEntry> postFilter(List<ManifestEntry> entries) {
-        if (inputFilter == null) {
-            return entries;
-        }
+    public boolean supportsLimitPushManifestEntries() {
+        return false;
+    }
+
+    @Override
+    protected boolean postFilterManifestEntriesEnabled() {
+        return inputFilter != null;
+    }
+
+    @Override
+    protected List<ManifestEntry> postFilterManifestEntries(List<ManifestEntry> entries) {
+        checkNotNull(inputFilter);
 
         // group by row id range
         RangeHelper<ManifestEntry> rangeHelper =
@@ -213,23 +242,41 @@ public class DataEvolutionFileStoreScan extends AppendOnlyFileStoreScan {
     /** Note: Keep this thread-safe. */
     @Override
     protected boolean filterByStats(ManifestEntry entry) {
-        // If indices is null, all entries should be kept
-        if (this.indices == null) {
+        DataFileMeta file = entry.file();
+
+        if (readType != null) {
+            boolean containsReadCol = false;
+            RowType fileType =
+                    scanTableSchema(file.schemaId()).project(file.writeCols()).logicalRowType();
+            for (String field : readType.getFieldNames()) {
+                if (fileType.containsField(field)) {
+                    containsReadCol = true;
+                    break;
+                }
+            }
+            if (!containsReadCol) {
+                return false;
+            }
+        }
+
+        // If rowRanges is null, all entries should be kept
+        if (this.rowRanges == null) {
             return true;
         }
 
         // If entry.firstRowId does not exist, keep the entry
-        Long firstRowId = entry.file().firstRowId();
+        Long firstRowId = file.firstRowId();
         if (firstRowId == null) {
             return true;
         }
 
-        // Check if any value in indices is in the range [firstRowId, firstRowId + rowCount)
-        long rowCount = entry.file().rowCount();
-        long endRowId = firstRowId + rowCount;
+        // Check if any value in indices is in the range [firstRowId, firstRowId + rowCount - 1]
+        long rowCount = file.rowCount();
+        long endRowId = firstRowId + rowCount - 1;
+        Range fileRowRange = new Range(firstRowId, endRowId);
 
-        for (Long index : this.indices) {
-            if (index >= firstRowId && index < endRowId) {
+        for (Range expected : rowRanges) {
+            if (Range.intersection(fileRowRange, expected) != null) {
                 return true;
             }
         }

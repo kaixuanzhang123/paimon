@@ -18,6 +18,7 @@
 
 package org.apache.paimon.spark
 
+import org.apache.paimon.partition.PartitionPredicate
 import org.apache.paimon.predicate.Predicate
 import org.apache.paimon.table.FormatTable
 
@@ -29,15 +30,15 @@ import org.apache.spark.sql.types.StructType
 
 import scala.collection.JavaConverters._
 
-/** Scan for {@link FormatTable} */
+/** Scan for [[ FormatTable ]] */
 case class PaimonFormatTableScan(
     table: FormatTable,
     requiredSchema: StructType,
-    filters: Seq[Predicate],
-    override val pushDownLimit: Option[Int])
-  extends PaimonFormatTableBaseScan(table, requiredSchema, filters, pushDownLimit)
-  with SupportsRuntimeFiltering
-  with ScanHelper {
+    pushedPartitionFilters: Seq[PartitionPredicate],
+    pushedDataFilters: Seq[Predicate],
+    override val pushedLimit: Option[Int] = None)
+  extends PaimonFormatTableBaseScan
+  with SupportsRuntimeFiltering {
 
   override def filterAttributes(): Array[NamedReference] = {
     val requiredFields = readBuilder.readType().getFieldNames.asScala
@@ -59,7 +60,8 @@ case class PaimonFormatTableScan(
     if (partitionFilter.nonEmpty) {
       readBuilder.withFilter(partitionFilter.head)
       // set inputPartitions null to trigger to get the new splits.
-      inputPartitions = null
+      _inputSplits = null
+      _inputPartitions = null
     }
   }
 }

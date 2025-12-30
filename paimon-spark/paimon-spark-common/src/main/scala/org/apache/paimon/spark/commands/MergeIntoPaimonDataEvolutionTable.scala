@@ -32,7 +32,7 @@ import org.apache.paimon.table.source.DataSplit
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
 import org.apache.spark.sql.PaimonUtils._
 import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer.resolver
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, EqualTo, Expression, ExprId, Literal}
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -114,6 +114,39 @@ case class MergeIntoPaimonDataEvolutionTable(
     map
   }
 
+  /**
+   * Self-Merge pattern:
+   * {{{
+   * MERGE INTO T AS t
+   * USING T AS s
+   * ON t._ROW_ID = s._ROW_ID
+   * WHEN MATCHED THEN UPDATE ... SET ...
+   * }}}
+   * For this pattern, the execution can be optimized to:
+   *
+   * `Scan -> MergeRows -> Write`
+   *
+   * without any extra shuffle, join, or sort.
+   */
+  private lazy val isSelfMergeOnRowId: Boolean = {
+    if (!targetRelation.name.equals(sourceRelation.name)) {
+      false
+    } else {
+      matchedCondition match {
+        case EqualTo(left: AttributeReference, right: AttributeReference)
+            if left.name == ROW_ID_NAME && right.name == ROW_ID_NAME =>
+          true
+        case _ => false
+      }
+    }
+  }
+
+  assert(
+    !(isSelfMergeOnRowId && (notMatchedActions.nonEmpty || notMatchedBySourceActions.nonEmpty)),
+    "Self-Merge on _ROW_ID only supports WHEN MATCHED THEN UPDATE. WHEN NOT MATCHED and WHEN " +
+      "NOT MATCHED BY SOURCE are not supported."
+  )
+
   lazy val targetRelation: DataSourceV2Relation = PaimonRelation.getPaimonRelation(targetTable)
   lazy val sourceRelation: DataSourceV2Relation = PaimonRelation.getPaimonRelation(sourceTable)
 
@@ -148,18 +181,33 @@ case class MergeIntoPaimonDataEvolutionTable(
   }
 
   private def targetRelatedSplits(sparkSession: SparkSession): Seq[DataSplit] = {
-    val targetDss = createDataset(
-      sparkSession,
-      targetRelation
-    )
+    // Self-Merge shortcut:
+    // In Self-Merge mode, every row in the table may be updated, so we scan all splits.
+    if (isSelfMergeOnRowId) {
+      return table
+        .newSnapshotReader()
+        .read()
+        .splits()
+        .asScala
+        .map(_.asInstanceOf[DataSplit])
+        .toSeq
+    }
+
     val sourceDss = createDataset(sparkSession, sourceRelation)
 
-    val firstRowIdsTouched = mutable.Set.empty[Long]
+    val firstRowIdsTouched = extractSourceRowIdMapping match {
+      case Some(sourceRowIdAttr) =>
+        // Shortcut: Directly get _FIRST_ROW_IDs from the source table.
+        findRelatedFirstRowIds(sourceDss, sparkSession, sourceRowIdAttr.name).toSet
 
-    firstRowIdsTouched ++= findRelatedFirstRowIds(
-      targetDss.alias("_left").join(sourceDss, toColumn(matchedCondition), "inner"),
-      sparkSession,
-      "_left." + ROW_ID_NAME)
+      case None =>
+        // Perform the full join to find related _FIRST_ROW_IDs.
+        val targetDss = createDataset(sparkSession, targetRelation)
+        findRelatedFirstRowIds(
+          targetDss.alias("_left").join(sourceDss, toColumn(matchedCondition), "inner"),
+          sparkSession,
+          "_left." + ROW_ID_NAME).toSet
+    }
 
     table
       .newSnapshotReader()
@@ -198,8 +246,16 @@ case class MergeIntoPaimonDataEvolutionTable(
     val updateColumnsSorted = updateColumns.toSeq.sortBy(
       s => targetTable.output.map(x => x.toString()).indexOf(s.toString()))
 
-    val assignments = redundantColumns.map(column => Assignment(column, column))
-    val output = updateColumnsSorted ++ redundantColumns
+    // Different Spark versions might produce duplicate attributes between `output` and
+    // `metadataOutput`, so manually deduplicate by `exprId`.
+    val metadataColumns = (targetRelation.output ++ targetRelation.metadataOutput)
+      .filter(attr => attr.name.equals(ROW_ID_NAME))
+      .groupBy(_.exprId)
+      .map { case (_, attrs) => attrs.head }
+      .toSeq
+
+    val assignments = metadataColumns.map(column => Assignment(column, column))
+    val output = updateColumnsSorted ++ metadataColumns
     val realUpdateActions = matchedActions
       .map(s => s.asInstanceOf[UpdateAction])
       .map(
@@ -215,53 +271,112 @@ case class MergeIntoPaimonDataEvolutionTable(
       allFields ++= action.references.flatMap(r => extractFields(r)).seq
     }
 
-    val allReadFieldsOnTarget = allFields.filter(
-      field =>
-        targetTable.output.exists(
-          attr => attr.toString().equals(field.toString()))) ++ redundantColumns
-    val allReadFieldsOnSource = allFields.filter(
-      field => sourceTable.output.exists(attr => attr.toString().equals(field.toString())))
+    val toWrite = if (isSelfMergeOnRowId) {
+      // Self-Merge shortcut:
+      // - Scan the target table only (no source scan, no join), and read all columns required by
+      //   merge condition and update expressions.
+      // - Rewrite all source-side AttributeReferences to the corresponding target attributes.
+      // - The scan output already satisfies the required partitioning and ordering for partial
+      //   updates, so no extra shuffle or sort is needed.
 
-    val targetReadPlan =
-      touchedFileTargetRelation.copy(targetRelation.table, allReadFieldsOnTarget.toSeq)
-    val targetTableProjExprs = targetReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_TARGET)()
-    val targetTableProj = Project(targetTableProjExprs, targetReadPlan)
+      val targetAttrsDedup: Seq[AttributeReference] =
+        (targetRelation.output ++ targetRelation.metadataOutput)
+          .groupBy(_.exprId)
+          .map { case (_, attrs) => attrs.head }
+          .toSeq
 
-    val sourceReadPlan = sourceRelation.copy(sourceRelation.table, allReadFieldsOnSource.toSeq)
-    val sourceTableProjExprs = sourceReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_SOURCE)()
-    val sourceTableProj = Project(sourceTableProjExprs, sourceReadPlan)
+      val neededNames: Set[String] = (allFields ++ metadataColumns).map(_.name).toSet
+      val allReadFieldsOnTarget: Seq[AttributeReference] =
+        targetAttrsDedup.filter(a => neededNames.exists(n => resolver(n, a.name)))
+      val readPlan = touchedFileTargetRelation.copy(output = allReadFieldsOnTarget)
 
-    val joinPlan =
-      Join(targetTableProj, sourceTableProj, LeftOuter, Some(matchedCondition), JoinHint.NONE)
+      // Build mapping: source exprId -> target attr (matched by column name).
+      val sourceToTarget = {
+        val targetAttrs = targetRelation.output ++ targetRelation.metadataOutput
+        val sourceAttrs = sourceRelation.output ++ sourceRelation.metadataOutput
+        sourceAttrs.flatMap {
+          s => targetAttrs.find(t => resolver(t.name, s.name)).map(t => s.exprId -> t)
+        }.toMap
+      }
 
-    val rowFromSourceAttr = attribute(ROW_FROM_SOURCE, joinPlan)
-    val rowFromTargetAttr = attribute(ROW_FROM_TARGET, joinPlan)
+      def rewriteSourceToTarget(
+          expr: Expression,
+          m: Map[ExprId, AttributeReference]): Expression = {
+        expr.transform {
+          case a: AttributeReference if m.contains(a.exprId) => m(a.exprId)
+        }
+      }
 
-    val mergeRows = MergeRows(
-      isSourceRowPresent = rowFromSourceAttr,
-      isTargetRowPresent = rowFromTargetAttr,
-      matchedInstructions = realUpdateActions
-        .map(
-          action => {
-            Keep(action.condition.getOrElse(TrueLiteral), action.assignments.map(a => a.value))
-          }) ++ Seq(Keep(TrueLiteral, output)),
-      notMatchedInstructions = Nil,
-      notMatchedBySourceInstructions = Seq(Keep(TrueLiteral, output)).toSeq,
-      checkCardinality = false,
-      output = output,
-      child = joinPlan
-    )
+      val rewrittenUpdateActions: Seq[UpdateAction] = realUpdateActions.map {
+        ua =>
+          val newCond = ua.condition.map(c => rewriteSourceToTarget(c, sourceToTarget))
+          val newAssignments = ua.assignments.map {
+            a => Assignment(a.key, rewriteSourceToTarget(a.value, sourceToTarget))
+          }
+          ua.copy(condition = newCond, assignments = newAssignments)
+      }
 
-    val firstRowIdsFinal = firstRowIds
-    val firstRowIdUdf = udf((rowId: Long) => floorBinarySearch(firstRowIdsFinal, rowId))
-    val firstRowIdColumn = firstRowIdUdf(col(ROW_ID_NAME))
-    val toWrite =
-      createDataset(sparkSession, mergeRows).withColumn(FIRST_ROW_ID_NAME, firstRowIdColumn)
-    assert(toWrite.schema.fields.length == updateColumnsSorted.size + 2)
-    val sortedDs = toWrite
-      .repartitionByRange(firstRowIdColumn)
-      .sortWithinPartitions(FIRST_ROW_ID_NAME, ROW_ID_NAME)
-    partialColumnWriter.writePartialFields(sortedDs, updateColumnsSorted.map(_.name))
+      val mergeRows = MergeRows(
+        isSourceRowPresent = TrueLiteral,
+        isTargetRowPresent = TrueLiteral,
+        matchedInstructions = rewrittenUpdateActions
+          .map(
+            action => {
+              Keep(action.condition.getOrElse(TrueLiteral), action.assignments.map(a => a.value))
+            }) ++ Seq(Keep(TrueLiteral, output)),
+        notMatchedInstructions = Nil,
+        notMatchedBySourceInstructions = Seq(Keep(TrueLiteral, output)),
+        checkCardinality = false,
+        output = output,
+        child = readPlan
+      )
+
+      val withFirstRowId = addFirstRowId(sparkSession, mergeRows)
+      assert(withFirstRowId.schema.fields.length == updateColumnsSorted.size + 2)
+      withFirstRowId
+    } else {
+      val allReadFieldsOnTarget = allFields.filter(
+        field =>
+          targetTable.output.exists(attr => attr.exprId.equals(field.exprId))) ++ metadataColumns
+      val allReadFieldsOnSource =
+        allFields.filter(
+          field => sourceTable.output.exists(attr => attr.exprId.equals(field.exprId)))
+
+      val targetReadPlan =
+        touchedFileTargetRelation.copy(output = allReadFieldsOnTarget.toSeq)
+      val targetTableProjExprs = targetReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_TARGET)()
+      val targetTableProj = Project(targetTableProjExprs, targetReadPlan)
+
+      val sourceReadPlan = sourceRelation.copy(output = allReadFieldsOnSource.toSeq)
+      val sourceTableProjExprs = sourceReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_SOURCE)()
+      val sourceTableProj = Project(sourceTableProjExprs, sourceReadPlan)
+
+      val joinPlan =
+        Join(targetTableProj, sourceTableProj, LeftOuter, Some(matchedCondition), JoinHint.NONE)
+      val rowFromSourceAttr = attribute(ROW_FROM_SOURCE, joinPlan)
+      val rowFromTargetAttr = attribute(ROW_FROM_TARGET, joinPlan)
+      val mergeRows = MergeRows(
+        isSourceRowPresent = rowFromSourceAttr,
+        isTargetRowPresent = rowFromTargetAttr,
+        matchedInstructions = realUpdateActions
+          .map(
+            action => {
+              Keep(action.condition.getOrElse(TrueLiteral), action.assignments.map(a => a.value))
+            }) ++ Seq(Keep(TrueLiteral, output)),
+        notMatchedInstructions = Nil,
+        notMatchedBySourceInstructions = Seq(Keep(TrueLiteral, output)).toSeq,
+        checkCardinality = false,
+        output = output,
+        child = joinPlan
+      )
+      val withFirstRowId = addFirstRowId(sparkSession, mergeRows)
+      assert(withFirstRowId.schema.fields.length == updateColumnsSorted.size + 2)
+      withFirstRowId
+        .repartitionByRange(col(FIRST_ROW_ID_NAME))
+        .sortWithinPartitions(FIRST_ROW_ID_NAME, ROW_ID_NAME)
+    }
+
+    partialColumnWriter.writePartialFields(toWrite, updateColumnsSorted.map(_.name))
   }
 
   private def insertActionInvoke(
@@ -303,6 +418,43 @@ case class MergeIntoPaimonDataEvolutionTable(
 
     val toWrite = createDataset(sparkSession, mergeRows)
     writer.write(toWrite)
+  }
+
+  /**
+   * Attempts to identify a direct mapping from sourceTable's attribute to the target table's
+   * `_ROW_ID`.
+   *
+   * This is a shortcut optimization for `MERGE INTO` to avoid a full, expensive join when the merge
+   * condition is a simple equality on the target's `_ROW_ID`.
+   *
+   * @return
+   *   An `Option` containing the sourceTable's attribute if a pattern like
+   *   `target._ROW_ID = source.col` (or its reverse) is found, otherwise `None`.
+   */
+  private def extractSourceRowIdMapping: Option[AttributeReference] = {
+
+    // Helper to check if an attribute is the target's _ROW_ID
+    def isTargetRowId(attr: AttributeReference): Boolean = {
+      attr.name == ROW_ID_NAME && (targetRelation.output ++ targetRelation.metadataOutput)
+        .exists(_.exprId.equals(attr.exprId))
+    }
+
+    // Helper to check if an attribute belongs to the source table
+    def isSourceAttribute(attr: AttributeReference): Boolean = {
+      (sourceRelation.output ++ sourceRelation.metadataOutput).exists(_.exprId.equals(attr.exprId))
+    }
+
+    matchedCondition match {
+      // Case 1: target._ROW_ID = source.col
+      case EqualTo(left: AttributeReference, right: AttributeReference)
+          if isTargetRowId(left) && isSourceAttribute(right) =>
+        Some(right)
+      // Case 2: source.col = target._ROW_ID
+      case EqualTo(left: AttributeReference, right: AttributeReference)
+          if isSourceAttribute(left) && isTargetRowId(right) =>
+        Some(left)
+      case _ => None
+    }
   }
 
   private def findRelatedFirstRowIds(
@@ -347,6 +499,13 @@ case class MergeIntoPaimonDataEvolutionTable(
   private def attribute(name: String, plan: LogicalPlan) =
     plan.output.find(attr => resolver(name, attr.name)).get
 
+  private def addFirstRowId(sparkSession: SparkSession, plan: LogicalPlan): Dataset[Row] = {
+    assert(plan.output.exists(_.name.equals(ROW_ID_NAME)))
+    val firstRowIdsFinal = firstRowIds
+    val firstRowIdUdf = udf((rowId: Long) => floorBinarySearch(firstRowIdsFinal, rowId))
+    val firstRowIdColumn = firstRowIdUdf(col(ROW_ID_NAME))
+    createDataset(sparkSession, plan).withColumn(FIRST_ROW_ID_NAME, firstRowIdColumn)
+  }
 }
 
 object MergeIntoPaimonDataEvolutionTable {

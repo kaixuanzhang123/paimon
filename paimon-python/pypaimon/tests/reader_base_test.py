@@ -296,10 +296,13 @@ class ReaderBasicTest(unittest.TestCase):
         partition = GenericRow(['East', 'Boston'], partition_fields)
 
         # Create ADD entry
+        from pypaimon.data.timestamp import Timestamp
+        import time
         add_file_meta = Mock(spec=DataFileMeta)
         add_file_meta.row_count = 200
         add_file_meta.file_size = 2048
-        add_file_meta.creation_time = datetime.now()
+        add_file_meta.creation_time = Timestamp.now()
+        add_file_meta.creation_time_epoch_millis = Mock(return_value=int(time.time() * 1000))
 
         add_entry = ManifestEntry(
             kind=0,  # ADD
@@ -313,7 +316,8 @@ class ReaderBasicTest(unittest.TestCase):
         delete_file_meta = Mock(spec=DataFileMeta)
         delete_file_meta.row_count = 80
         delete_file_meta.file_size = 800
-        delete_file_meta.creation_time = datetime.now()
+        delete_file_meta.creation_time = Timestamp.now()
+        delete_file_meta.creation_time_epoch_millis = Mock(return_value=int(time.time() * 1000))
 
         delete_entry = ManifestEntry(
             kind=1,  # DELETE
@@ -349,10 +353,13 @@ class ReaderBasicTest(unittest.TestCase):
             DataField(1, "city", AtomicType("STRING"))
         ]
         partition1 = GenericRow(['East', 'Boston'], partition_fields)
+        from pypaimon.data.timestamp import Timestamp
+        import time
         file_meta1 = Mock(spec=DataFileMeta)
         file_meta1.row_count = 150
         file_meta1.file_size = 1500
-        file_meta1.creation_time = datetime.now()
+        file_meta1.creation_time = Timestamp.now()
+        file_meta1.creation_time_epoch_millis = Mock(return_value=int(time.time() * 1000))
 
         entry1 = ManifestEntry(
             kind=0,  # ADD
@@ -367,7 +374,8 @@ class ReaderBasicTest(unittest.TestCase):
         file_meta2 = Mock(spec=DataFileMeta)
         file_meta2.row_count = 75
         file_meta2.file_size = 750
-        file_meta2.creation_time = datetime.now()
+        file_meta2.creation_time = Timestamp.now()
+        file_meta2.creation_time_epoch_millis = Mock(return_value=int(time.time() * 1000))
 
         entry2 = ManifestEntry(
             kind=1,  # DELETE
@@ -600,6 +608,7 @@ class ReaderBasicTest(unittest.TestCase):
         )
 
         # Create DataFileMeta with value_stats_cols
+        from pypaimon.data.timestamp import Timestamp
         file_meta = DataFileMeta(
             file_name=f"test-file-{test_name}.parquet",
             file_size=1024,
@@ -613,7 +622,7 @@ class ReaderBasicTest(unittest.TestCase):
             schema_id=0,
             level=0,
             extra_files=[],
-            creation_time=1234567890,
+            creation_time=Timestamp.from_epoch_millis(1234567890),
             delete_row_count=0,
             embedded_index=None,
             file_source=None,
@@ -678,7 +687,7 @@ class ReaderBasicTest(unittest.TestCase):
 
     def test_split_target_size(self):
         """Test source.split.target-size configuration effect on split generation."""
-        from pypaimon.common.core_options import CoreOptions
+        from pypaimon.common.options.core_options import CoreOptions
 
         pa_schema = pa.schema([
             ('f0', pa.int64()),
@@ -688,7 +697,7 @@ class ReaderBasicTest(unittest.TestCase):
         # Test with small target_split_size (512B) - should generate more splits
         schema_small = Schema.from_pyarrow_schema(
             pa_schema,
-            options={CoreOptions.SOURCE_SPLIT_TARGET_SIZE: '512b'}
+            options={CoreOptions.SOURCE_SPLIT_TARGET_SIZE.key(): '512b'}
         )
         self.catalog.create_table('default.test_split_target_size_small', schema_small, False)
         table_small = self.catalog.get_table('default.test_split_target_size_small')
@@ -738,7 +747,7 @@ class ReaderBasicTest(unittest.TestCase):
 
     def test_split_open_file_cost(self):
         """Test source.split.open-file-cost configuration effect on split generation."""
-        from pypaimon.common.core_options import CoreOptions
+        from pypaimon.common.options.core_options import CoreOptions
 
         pa_schema = pa.schema([
             ('f0', pa.int64()),
@@ -749,8 +758,8 @@ class ReaderBasicTest(unittest.TestCase):
         schema_large_cost = Schema.from_pyarrow_schema(
             pa_schema,
             options={
-                CoreOptions.SOURCE_SPLIT_TARGET_SIZE: '128mb',
-                CoreOptions.SOURCE_SPLIT_OPEN_FILE_COST: '64mb'
+                CoreOptions.SOURCE_SPLIT_TARGET_SIZE.key(): '128mb',
+                CoreOptions.SOURCE_SPLIT_OPEN_FILE_COST.key(): '64mb'
             }
         )
         self.catalog.create_table('default.test_split_open_file_cost_large', schema_large_cost, False)
@@ -778,7 +787,7 @@ class ReaderBasicTest(unittest.TestCase):
         # Test with default open_file_cost (4MB) - should generate fewer splits
         schema_default = Schema.from_pyarrow_schema(
             pa_schema,
-            options={CoreOptions.SOURCE_SPLIT_TARGET_SIZE: '128mb'}
+            options={CoreOptions.SOURCE_SPLIT_TARGET_SIZE.key(): '128mb'}
         )
         self.catalog.create_table('default.test_split_open_file_cost_default', schema_default, False)
         table_default = self.catalog.get_table('default.test_split_open_file_cost_default')
@@ -807,3 +816,25 @@ class ReaderBasicTest(unittest.TestCase):
             f"Large open_file_cost should generate more splits. "
             f"Got {len(splits_large_cost)} splits with 64MB cost vs "
             f"{len(splits_default)} splits with default")
+
+    def test_create_table_with_invalid_type(self):
+        """Test create_table raises ValueError when table type is not 'table'."""
+        from pypaimon.common.options.core_options import CoreOptions
+
+        pa_schema = pa.schema([
+            ('f0', pa.int64()),
+            ('f1', pa.string())
+        ])
+
+        # Create schema with invalid type option (not "table")
+        schema_with_invalid_type = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={CoreOptions.TYPE.key(): 'view'}  # Invalid type, should be "table"
+        )
+
+        # Attempt to create table should raise ValueError
+        with self.assertRaises(ValueError) as context:
+            self.catalog.create_table('default.test_invalid_type', schema_with_invalid_type, False)
+
+        # Verify the error message contains the expected text
+        self.assertIn("Table Type", str(context.exception))

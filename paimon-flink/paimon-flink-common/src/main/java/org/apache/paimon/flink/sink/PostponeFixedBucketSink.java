@@ -50,7 +50,7 @@ public class PostponeFixedBucketSink extends FlinkWriteSink<InternalRow> {
     @Override
     protected OneInputStreamOperatorFactory<InternalRow, Committable> createWriteOperatorFactory(
             StoreSinkWrite.Provider writeProvider, String commitUser) {
-        return new RowDataStoreWriteOperator.Factory(table, null, writeProvider, commitUser) {
+        return new RowDataStoreWriteOperator.Factory(table, writeProvider, commitUser) {
             @Override
             @SuppressWarnings("unchecked, rawtypes")
             public StreamOperator createStreamOperator(StreamOperatorParameters parameters) {
@@ -68,8 +68,16 @@ public class PostponeFixedBucketSink extends FlinkWriteSink<InternalRow> {
     @Override
     protected Committer.Factory<Committable, ManifestCommittable> createCommitterFactory() {
         if (overwritePartition == null) {
-            // The table has copied bucket option outside, no need to change anything
-            return super.createCommitterFactory();
+            // The table has copied bucket option outside, no need to change.
+            return context ->
+                    new StoreCommitter(
+                            table,
+                            table.newCommit(context.commitUser())
+                                    .withOverwrite(overwritePartition)
+                                    .ignoreEmptyCommit(!context.streamingCheckpointEnabled())
+                                    // Need to check conflict
+                                    .appendCommitCheckConflict(true),
+                            context);
         } else {
             // When overwriting, the postpone bucket files need to be deleted, so using a postpone
             // bucket table commit here
