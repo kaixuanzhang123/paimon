@@ -18,7 +18,9 @@
 
 package org.apache.paimon.spark.sql
 
+import org.apache.paimon.CoreOptions
 import org.apache.paimon.Snapshot.CommitKind
+import org.apache.paimon.format.FileFormat
 import org.apache.paimon.spark.PaimonSparkTestBase
 
 import org.apache.spark.sql.Row
@@ -28,7 +30,11 @@ import org.apache.spark.sql.util.QueryExecutionListener
 
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
+import scala.collection.JavaConverters._
+
 abstract class RowTrackingTestBase extends PaimonSparkTestBase {
+
+  import testImplicits._
 
   test("Row Tracking: read row Tracking") {
     withTable("t") {
@@ -311,9 +317,38 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
   }
 
   test("Data Evolution: merge into table with data-evolution") {
+    Seq("parquet", "avro").foreach {
+      format =>
+        withTable("s", "t") {
+          sql("CREATE TABLE s (id INT, b INT)")
+          sql("INSERT INTO s VALUES (1, 11), (2, 22)")
+
+          sql(s"""CREATE TABLE t (id INT, b INT, c INT) TBLPROPERTIES
+                 |('row-tracking.enabled' = 'true',
+                 |'data-evolution.enabled' = 'true',
+                 |'file.format' = '$format'
+                 |)""".stripMargin)
+          sql("INSERT INTO t SELECT /*+ REPARTITION(1) */ id, id AS b, id AS c FROM range(2, 4)")
+
+          sql("""
+                |MERGE INTO t
+                |USING s
+                |ON t.id = s.id
+                |WHEN MATCHED THEN UPDATE SET t.b = s.b
+                |WHEN NOT MATCHED THEN INSERT (id, b, c) VALUES (id, b, 11)
+                |""".stripMargin)
+          checkAnswer(sql("SELECT count(*) FROM t"), Seq(Row(3)))
+          checkAnswer(
+            sql("SELECT *, _ROW_ID, _SEQUENCE_NUMBER FROM t ORDER BY id"),
+            Seq(Row(1, 11, 11, 2, 2), Row(2, 22, 2, 0, 2), Row(3, 3, 3, 1, 2))
+          )
+        }
+    }
+  }
+
+  test("Data Evolution: merge into table with data-evolution for any source table") {
     withTable("s", "t") {
-      sql("CREATE TABLE s (id INT, b INT)")
-      sql("INSERT INTO s VALUES (1, 11), (2, 22)")
+      Seq((1, 11), (2, 22)).toDF("id", "b").createOrReplaceTempView("s")
 
       sql(
         "CREATE TABLE t (id INT, b INT, c INT) TBLPROPERTIES ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')")
@@ -615,6 +650,112 @@ abstract class RowTrackingTestBase extends PaimonSparkTestBase {
         sql("SELECT count(*) FROM `t$files`"),
         Seq(Row(1))
       )
+    }
+  }
+
+  test("Data Evolution: test global indexed column update action -- throw error") {
+    withTable("T") {
+      spark.sql("""
+                  |CREATE TABLE T (id INT, name STRING, pt STRING)
+                  |TBLPROPERTIES (
+                  |  'bucket' = '-1',
+                  |  'global-index.row-count-per-shard' = '10000',
+                  |  'row-tracking.enabled' = 'true',
+                  |  'data-evolution.enabled' = 'true')
+                  |  PARTITIONED BY (pt)
+                  |""".stripMargin)
+
+      // write two partitions: p0 & p1
+      var values =
+        (0 until 65000).map(i => s"($i, 'name_$i', 'p0')").mkString(",")
+      spark.sql(s"INSERT INTO T VALUES $values")
+
+      values = (0 until 35000).map(i => s"($i, 'name_$i', 'p1')").mkString(",")
+      spark.sql(s"INSERT INTO T VALUES $values")
+
+      // create global index for p0
+      val output =
+        spark
+          .sql(
+            "CALL sys.create_global_index(table => 'test.T', index_column => 'name', index_type => 'btree'," +
+              " partitions => 'pt=\"p0\"', options => 'btree-index.records-per-range=1000')")
+          .collect()
+          .head
+
+      assert(output.getBoolean(0))
+
+      // call merge into to update global-indexed partition
+      assert(intercept[RuntimeException] {
+        sql(s"""
+               |MERGE INTO T
+               |USING T AS source
+               |ON T._ROW_ID = source._ROW_ID AND T.pt = 'p0'
+               |WHEN MATCHED AND T.id = 500 THEN UPDATE SET name = 'updatedName'
+               |""".stripMargin)
+      }.getMessage
+        .contains("MergeInto: update columns contain globally indexed columns, not supported now."))
+
+      // call merge into to update non-indexed partition
+      sql(s"""
+             |MERGE INTO T
+             |USING T AS source
+             |ON T._ROW_ID = source._ROW_ID AND T.pt = 'p1'
+             |WHEN MATCHED AND T.id = 500 THEN UPDATE SET name = 'updatedName'
+             |""".stripMargin)
+    }
+  }
+
+  test("Data Evolution: test global indexed column update action -- drop partition index") {
+    withTable("T") {
+      spark.sql("""
+                  |CREATE TABLE T (id INT, name STRING, pt STRING)
+                  |TBLPROPERTIES (
+                  |  'bucket' = '-1',
+                  |  'global-index.row-count-per-shard' = '10000',
+                  |  'row-tracking.enabled' = 'true',
+                  |  'data-evolution.enabled' = 'true',
+                  |  'global-index.column-update-action' = 'DROP_PARTITION_INDEX')
+                  |  PARTITIONED BY (pt)
+                  |""".stripMargin)
+
+      // write two partitions: p0 & p1
+      var values =
+        (0 until 65000).map(i => s"($i, 'name_$i', 'p0')").mkString(",")
+      spark.sql(s"INSERT INTO T VALUES $values")
+
+      values = (0 until 35000).map(i => s"($i, 'name_$i', 'p1')").mkString(",")
+      spark.sql(s"INSERT INTO T VALUES $values")
+
+      // create global index for all parts
+      val output =
+        spark
+          .sql(
+            "CALL sys.create_global_index(table => 'test.T', index_column => 'name', index_type => 'btree'," +
+              " options => 'btree-index.records-per-range=1000')")
+          .collect()
+          .head
+
+      assert(output.getBoolean(0))
+
+      // call merge into to update some data of p1
+      sql(s"""
+             |MERGE INTO T
+             |USING T AS source
+             |ON T._ROW_ID = source._ROW_ID AND T.pt = 'p1'
+             |WHEN MATCHED AND T.id = 500 THEN UPDATE SET name = 'updatedName'
+             |""".stripMargin)
+
+      val table = loadTable("T")
+      val indexEntries = table
+        .store()
+        .newIndexFileHandler()
+        .scanEntries()
+        .asScala
+        .filter(_.indexFile().indexType() == "btree")
+
+      // all modified partitions' index entries should have been removed
+      assert(indexEntries.exists(entry => entry.partition().getString(0).toString.equals("p0")))
+      assert(!indexEntries.exists(entry => entry.partition().getString(0).toString.equals("p1")))
     }
   }
 }

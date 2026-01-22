@@ -18,15 +18,20 @@
 
 package org.apache.paimon.spark.commands
 
+import org.apache.paimon.CoreOptions.GlobalIndexColumnUpdateAction
+import org.apache.paimon.data.BinaryRow
 import org.apache.paimon.format.blob.BlobFileFormat.isBlobFile
+import org.apache.paimon.io.{CompactIncrement, DataIncrement}
+import org.apache.paimon.manifest.IndexManifestEntry
 import org.apache.paimon.spark.SparkTable
 import org.apache.paimon.spark.catalyst.analysis.PaimonRelation
+import org.apache.paimon.spark.catalyst.analysis.PaimonRelation.isPaimonTable
 import org.apache.paimon.spark.catalyst.analysis.PaimonUpdateTable.toColumn
 import org.apache.paimon.spark.leafnode.PaimonLeafRunnableCommand
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.spark.util.ScanPlanHelper.createNewScanPlan
 import org.apache.paimon.table.FileStoreTable
-import org.apache.paimon.table.sink.CommitMessage
+import org.apache.paimon.table.sink.{CommitMessage, CommitMessageImpl}
 import org.apache.paimon.table.source.DataSplit
 
 import org.apache.spark.sql.{Dataset, Row, SparkSession}
@@ -41,10 +46,10 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.StructType
 
+import scala.collection.{immutable, mutable}
 import scala.collection.JavaConverters._
 import scala.collection.Searching.{search, Found, InsertionPoint}
-import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
 /** Command for Merge Into for Data Evolution paimon table. */
 case class MergeIntoPaimonDataEvolutionTable(
@@ -75,7 +80,24 @@ case class MergeIntoPaimonDataEvolutionTable(
   import MergeIntoPaimonDataEvolutionTable._
 
   override val table: FileStoreTable = v2Table.getTable.asInstanceOf[FileStoreTable]
-  private val firstRowIds: Seq[Long] = table
+
+  private val updateColumns: Set[AttributeReference] = {
+    val columns = mutable.Set[AttributeReference]()
+    for (action <- matchedActions) {
+      action match {
+        case updateAction: UpdateAction =>
+          for (assignment <- updateAction.assignments) {
+            if (!assignment.key.equals(assignment.value)) {
+              val key = assignment.key.asInstanceOf[AttributeReference]
+              columns ++= Seq(key)
+            }
+          }
+      }
+    }
+    columns.toSet
+  }
+
+  private val firstRowIds: immutable.IndexedSeq[Long] = table
     .store()
     .newScan()
     .withManifestEntryFilter(
@@ -90,7 +112,7 @@ case class MergeIntoPaimonDataEvolutionTable(
     .map(file => file.file().firstRowId().asInstanceOf[Long])
     .distinct
     .sorted
-    .toSeq
+    .toIndexedSeq
 
   private val firstRowIdToBlobFirstRowIds = {
     val map = new mutable.HashMap[Long, List[Long]]()
@@ -129,7 +151,9 @@ case class MergeIntoPaimonDataEvolutionTable(
    * without any extra shuffle, join, or sort.
    */
   private lazy val isSelfMergeOnRowId: Boolean = {
-    if (!targetRelation.name.equals(sourceRelation.name)) {
+    if (!isPaimonTable(sourceTable)) {
+      false
+    } else if (!targetRelation.name.equals(PaimonRelation.getPaimonRelation(sourceTable).name)) {
       false
     } else {
       matchedCondition match {
@@ -148,7 +172,6 @@ case class MergeIntoPaimonDataEvolutionTable(
   )
 
   lazy val targetRelation: DataSourceV2Relation = PaimonRelation.getPaimonRelation(targetTable)
-  lazy val sourceRelation: DataSourceV2Relation = PaimonRelation.getPaimonRelation(sourceTable)
 
   lazy val tableSchema: StructType = v2Table.schema
 
@@ -167,9 +190,10 @@ case class MergeIntoPaimonDataEvolutionTable(
 
     // step 2: invoke update action
     val updateCommit =
-      if (matchedActions.nonEmpty)
-        updateActionInvoke(sparkSession, touchedFileTargetRelation)
-      else Nil
+      if (matchedActions.nonEmpty) {
+        val updateResult = updateActionInvoke(sparkSession, touchedFileTargetRelation)
+        checkUpdateResult(updateResult)
+      } else Nil
 
     // step 3: invoke insert action
     val insertCommit =
@@ -193,7 +217,7 @@ case class MergeIntoPaimonDataEvolutionTable(
         .toSeq
     }
 
-    val sourceDss = createDataset(sparkSession, sourceRelation)
+    val sourceDss = createDataset(sparkSession, sourceTable)
 
     val firstRowIdsTouched = extractSourceRowIdMapping match {
       case Some(sourceRowIdAttr) =>
@@ -230,18 +254,6 @@ case class MergeIntoPaimonDataEvolutionTable(
       (o1, o2) => {
         o1.toString().compareTo(o2.toString())
       }) ++ mergeFields
-    val updateColumns = mutable.Set[AttributeReference]()
-    for (action <- matchedActions) {
-      action match {
-        case updateAction: UpdateAction =>
-          for (assignment <- updateAction.assignments) {
-            if (!assignment.key.equals(assignment.value)) {
-              val key = assignment.key.asInstanceOf[AttributeReference]
-              updateColumns ++= Seq(key)
-            }
-          }
-      }
-    }
 
     val updateColumnsSorted = updateColumns.toSeq.sortBy(
       s => targetTable.output.map(x => x.toString()).indexOf(s.toString()))
@@ -293,7 +305,7 @@ case class MergeIntoPaimonDataEvolutionTable(
       // Build mapping: source exprId -> target attr (matched by column name).
       val sourceToTarget = {
         val targetAttrs = targetRelation.output ++ targetRelation.metadataOutput
-        val sourceAttrs = sourceRelation.output ++ sourceRelation.metadataOutput
+        val sourceAttrs = sourceTable.output ++ sourceTable.metadataOutput
         sourceAttrs.flatMap {
           s => targetAttrs.find(t => resolver(t.name, s.name)).map(t => s.exprId -> t)
         }.toMap
@@ -347,9 +359,9 @@ case class MergeIntoPaimonDataEvolutionTable(
       val targetTableProjExprs = targetReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_TARGET)()
       val targetTableProj = Project(targetTableProjExprs, targetReadPlan)
 
-      val sourceReadPlan = sourceRelation.copy(output = allReadFieldsOnSource.toSeq)
-      val sourceTableProjExprs = sourceReadPlan.output :+ Alias(TrueLiteral, ROW_FROM_SOURCE)()
-      val sourceTableProj = Project(sourceTableProjExprs, sourceReadPlan)
+      val sourceTableProjExprs =
+        allReadFieldsOnSource.toSeq :+ Alias(TrueLiteral, ROW_FROM_SOURCE)()
+      val sourceTableProj = Project(sourceTableProjExprs, sourceTable)
 
       val joinPlan =
         Join(targetTableProj, sourceTableProj, LeftOuter, Some(matchedCondition), JoinHint.NONE)
@@ -372,7 +384,7 @@ case class MergeIntoPaimonDataEvolutionTable(
       val withFirstRowId = addFirstRowId(sparkSession, mergeRows)
       assert(withFirstRowId.schema.fields.length == updateColumnsSorted.size + 2)
       withFirstRowId
-        .repartitionByRange(col(FIRST_ROW_ID_NAME))
+        .repartition(col(FIRST_ROW_ID_NAME))
         .sortWithinPartitions(FIRST_ROW_ID_NAME, ROW_ID_NAME)
     }
 
@@ -390,7 +402,7 @@ case class MergeIntoPaimonDataEvolutionTable(
       touchedFileTargetRelation.copy(targetRelation.table, allReadFieldsOnTarget.toSeq)
 
     val joinPlan =
-      Join(sourceRelation, targetReadPlan, LeftAnti, Some(matchedCondition), JoinHint.NONE)
+      Join(sourceTable, targetReadPlan, LeftAnti, Some(matchedCondition), JoinHint.NONE)
 
     // merge rows as there are multiple not matched actions
     val mergeRows = MergeRows(
@@ -441,7 +453,7 @@ case class MergeIntoPaimonDataEvolutionTable(
 
     // Helper to check if an attribute belongs to the source table
     def isSourceAttribute(attr: AttributeReference): Boolean = {
-      (sourceRelation.output ++ sourceRelation.metadataOutput).exists(_.exprId.equals(attr.exprId))
+      (sourceTable.output ++ sourceTable.metadataOutput).exists(_.exprId.equals(attr.exprId))
     }
 
     matchedCondition match {
@@ -454,6 +466,67 @@ case class MergeIntoPaimonDataEvolutionTable(
           if isSourceAttribute(left) && isTargetRowId(right) =>
         Some(left)
       case _ => None
+    }
+  }
+
+  private def checkUpdateResult(updateCommit: Seq[CommitMessage]): Seq[CommitMessage] = {
+    val affectedParts: Set[BinaryRow] = updateCommit.map(_.partition()).toSet
+    val rowType = table.rowType()
+
+    // find all global index files of affected partitions and updated columns
+    val latestSnapshot = table.latestSnapshot()
+    if (!latestSnapshot.isPresent) {
+      return updateCommit
+    }
+
+    val filter: org.apache.paimon.utils.Filter[IndexManifestEntry] =
+      (entry: IndexManifestEntry) => {
+        val globalIndexMeta = entry.indexFile().globalIndexMeta()
+        if (globalIndexMeta == null) {
+          false
+        } else {
+          val fieldName = rowType.getField(globalIndexMeta.indexFieldId()).name()
+          affectedParts.contains(entry.partition()) && updateColumns.exists(
+            _.name.equals(fieldName))
+        }
+      }
+
+    val affectedIndexEntries = table
+      .store()
+      .newIndexFileHandler()
+      .scan(latestSnapshot.get(), filter)
+      .asScala
+      .toSeq
+
+    if (affectedIndexEntries.isEmpty) {
+      updateCommit
+    } else {
+      table.coreOptions().globalIndexColumnUpdateAction() match {
+        case GlobalIndexColumnUpdateAction.THROW_ERROR =>
+          val updatedColNames = updateColumns.map(_.name)
+          val conflicted = affectedIndexEntries
+            .map(_.indexFile().globalIndexMeta().indexFieldId())
+            .map(id => rowType.getField(id).name())
+            .toSet
+          throw new RuntimeException(
+            s"""MergeInto: update columns contain globally indexed columns, not supported now.
+               |Updated columns: ${updatedColNames.toSeq.sorted.mkString("[", ", ", "]")}
+               |Conflicted columns: ${conflicted.toSeq.sorted.mkString("[", ", ", "]")}
+               |""".stripMargin)
+        case GlobalIndexColumnUpdateAction.DROP_PARTITION_INDEX =>
+          val grouped = affectedIndexEntries.groupBy(_.partition())
+          val deleteCommitMessages = ArrayBuffer.empty[CommitMessage]
+          grouped.foreach {
+            case (part, entries) =>
+              deleteCommitMessages += new CommitMessageImpl(
+                part,
+                0,
+                null,
+                DataIncrement.deleteIndexIncrement(entries.map(_.indexFile()).asJava),
+                CompactIncrement.emptyIncrement())
+          }
+          updateCommit ++ deleteCommitMessages
+      }
     }
   }
 
@@ -516,9 +589,7 @@ object MergeIntoPaimonDataEvolutionTable {
   final private val redundantColumns =
     Seq(PaimonMetadataColumn.ROW_ID.toAttribute)
 
-  def floorBinarySearch(sortedSeq: Seq[Long], value: Long): Long = {
-    val indexed = sortedSeq.toIndexedSeq
-
+  def floorBinarySearch(indexed: immutable.IndexedSeq[Long], value: Long): Long = {
     if (indexed.isEmpty) {
       throw new IllegalArgumentException("The input sorted sequence is empty.")
     }

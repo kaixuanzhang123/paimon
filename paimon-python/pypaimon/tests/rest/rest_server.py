@@ -24,10 +24,13 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 from urllib.parse import urlparse
 
-from pypaimon.api.api_request import (CreateDatabaseRequest,
+if TYPE_CHECKING:
+    from pypaimon.catalog.rest.rest_token import RESTToken
+
+from pypaimon.api.api_request import (AlterTableRequest, CreateDatabaseRequest,
                                       CreateTableRequest, RenameTableRequest)
 from pypaimon.api.api_response import (ConfigResponse, GetDatabaseResponse,
                                        GetTableResponse, ListDatabasesResponse,
@@ -44,6 +47,8 @@ from pypaimon.catalog.rest.table_metadata import TableMetadata
 from pypaimon.common.identifier import Identifier
 from pypaimon.common.json_util import JSON
 from pypaimon import Schema
+from pypaimon.schema.schema_change import Actions, SchemaChange
+from pypaimon.schema.schema_manager import SchemaManager
 from pypaimon.schema.table_schema import TableSchema
 
 
@@ -91,6 +96,105 @@ FORMAT_TABLE = "FORMAT_TABLE"
 OBJECT_TABLE = "OBJECT_TABLE"
 
 
+def _dict_to_schema_change(change_dict: dict) -> SchemaChange:
+    from pypaimon.schema.schema_change import (
+        SetOption, RemoveOption, UpdateComment, AddColumn, RenameColumn,
+        DropColumn, UpdateColumnType, UpdateColumnNullability,
+        UpdateColumnComment, UpdateColumnDefaultValue, UpdateColumnPosition, Move, MoveType
+    )
+
+    action = change_dict.get(Actions.FIELD_ACTION)
+    if action == Actions.SET_OPTION_ACTION:
+        return SetOption(key=change_dict["key"], value=change_dict["value"])
+    elif action == Actions.REMOVE_OPTION_ACTION:
+        return RemoveOption(key=change_dict["key"])
+    elif action == Actions.UPDATE_COMMENT_ACTION:
+        return UpdateComment(comment=change_dict.get("comment"))
+    elif action == Actions.ADD_COLUMN_ACTION:
+        from pypaimon.schema.data_types import DataTypeParser
+        data_type_value = change_dict.get("dataType") or change_dict.get(AddColumn.FIELD_DATA_TYPE)
+        if data_type_value is None:
+            raise ValueError(f"Missing dataType field in AddColumn change: {change_dict}")
+        data_type = DataTypeParser.parse_data_type(data_type_value)
+        move = None
+        if "move" in change_dict and change_dict["move"] is not None:
+            move_dict = change_dict["move"]
+            if isinstance(move_dict, dict):
+                move_type_str = move_dict.get("type") or move_dict.get(Move.FIELD_TYPE)
+                if move_type_str is None:
+                    raise ValueError(f"Missing type field in Move: {move_dict}")
+                move_type = MoveType(move_type_str)
+                field_name = move_dict.get("fieldName") or move_dict.get(Move.FIELD_FIELD_NAME)
+                if field_name is None:
+                    raise ValueError(f"Missing fieldName field in Move: {move_dict}")
+                reference_field = (
+                    move_dict.get("referenceFieldName") or
+                    move_dict.get(Move.FIELD_REFERENCE_FIELD_NAME)
+                )
+                move = Move(
+                    field_name=field_name,
+                    reference_field_name=reference_field,
+                    type=move_type
+                )
+        field_names = change_dict.get("fieldNames") or change_dict.get(AddColumn.FIELD_FIELD_NAMES)
+        if field_names is None:
+            raise ValueError(f"Missing fieldNames field in AddColumn change: {change_dict}")
+        return AddColumn(
+            field_names=field_names,
+            data_type=data_type,
+            comment=change_dict.get("comment") or change_dict.get(AddColumn.FIELD_COMMENT),
+            move=move
+        )
+    elif action == Actions.RENAME_COLUMN_ACTION:
+        return RenameColumn(field_names=change_dict["fieldNames"], new_name=change_dict["newName"])
+    elif action == Actions.DROP_COLUMN_ACTION:
+        return DropColumn(field_names=change_dict["fieldNames"])
+    elif action == Actions.UPDATE_COLUMN_TYPE_ACTION:
+        from pypaimon.schema.data_types import DataTypeParser
+        new_type = DataTypeParser.parse_data_type(change_dict["newDataType"])
+        return UpdateColumnType(
+            field_names=change_dict["fieldNames"],
+            new_data_type=new_type,
+            keep_nullability=change_dict.get("keepNullability", False)
+        )
+    elif action == Actions.UPDATE_COLUMN_NULLABILITY_ACTION:
+        return UpdateColumnNullability(
+            field_names=change_dict["fieldNames"],
+            new_nullability=change_dict["newNullability"]
+        )
+    elif action == Actions.UPDATE_COLUMN_COMMENT_ACTION:
+        return UpdateColumnComment(
+            field_names=change_dict["fieldNames"],
+            new_comment=change_dict.get("newComment")
+        )
+    elif action == Actions.UPDATE_COLUMN_DEFAULT_VALUE_ACTION:
+        return UpdateColumnDefaultValue(
+            field_names=change_dict["fieldNames"],
+            new_default_value=change_dict["newDefaultValue"]
+        )
+    elif action == Actions.UPDATE_COLUMN_POSITION_ACTION:
+        move_dict = change_dict.get("move") or change_dict.get(UpdateColumnPosition.FIELD_MOVE)
+        if move_dict is None:
+            raise ValueError(f"Missing move field in UpdateColumnPosition change: {change_dict}")
+        if not isinstance(move_dict, dict):
+            raise ValueError(f"move field must be a dict in UpdateColumnPosition change: {change_dict}")
+        move_type_str = move_dict.get("type") or move_dict.get(Move.FIELD_TYPE)
+        if move_type_str is None:
+            raise ValueError(f"Missing type field in Move: {move_dict}")
+        move_type = MoveType(move_type_str)
+        field_name = move_dict.get("fieldName") or move_dict.get(Move.FIELD_FIELD_NAME)
+        if field_name is None:
+            raise ValueError(f"Missing fieldName field in Move: {move_dict}")
+        move = Move(
+            field_name=field_name,
+            reference_field_name=move_dict.get("referenceFieldName") or move_dict.get(Move.FIELD_REFERENCE_FIELD_NAME),
+            type=move_type
+        )
+        return UpdateColumnPosition(move=move)
+    else:
+        raise ValueError(f"Unknown schema change action: {action}")
+
+
 class RESTCatalogServer:
     """Mock REST server for testing"""
 
@@ -112,6 +216,7 @@ class RESTCatalogServer:
         self.table_partitions_store: Dict[str, List] = {}
         self.no_permission_databases: List[str] = []
         self.no_permission_tables: List[str] = []
+        self.table_token_store: Dict[str, "RESTToken"] = {}
 
         # Initialize mock catalog (simplified)
         self.data_path = data_path
@@ -368,10 +473,12 @@ class RESTCatalogServer:
             # Basic table operations (GET, DELETE, etc.)
             return self._table_handle(method, data, lookup_identifier)
         elif len(path_parts) == 4:
-            # Extended operations (e.g., commit)
+            # Extended operations (e.g., commit, token)
             operation = path_parts[3]
             if operation == "commit":
                 return self._table_commit_handle(method, data, lookup_identifier, branch_part)
+            elif operation == "token":
+                return self._table_token_handle(method, lookup_identifier)
             else:
                 return self._mock_response(ErrorResponse(None, None, "Not Found", 404), 404)
         return self._mock_response(ErrorResponse(None, None, "Not Found", 404), 404)
@@ -453,13 +560,11 @@ class RESTCatalogServer:
             schema = table_metadata.schema.to_schema()
             response = self.mock_table(identifier, table_metadata, table_path, schema)
             return self._mock_response(response, 200)
-        #
-        # elif method == "POST":
-        #     # Alter table
-        #     request_body = JSON.from_json(data, AlterTableRequest)
-        #     self._alter_table_impl(identifier, request_body.get_changes())
-        #     return self._mock_response("", 200)
-
+        elif method == "POST":
+            # Alter table
+            request_body = JSON.from_json(data, AlterTableRequest)
+            self._alter_table_impl(identifier, request_body.changes)
+            return self._mock_response("", 200)
         elif method == "DELETE":
             # Drop table
             if identifier.get_full_name() not in self.table_metadata_store:
@@ -474,6 +579,44 @@ class RESTCatalogServer:
             return self._mock_response("", 200)
 
         return self._mock_response(ErrorResponse(None, None, "Method Not Allowed", 405), 405)
+
+    def _table_token_handle(self, method: str, identifier: Identifier) -> Tuple[str, int]:
+        if method != "GET":
+            return self._mock_response(ErrorResponse(None, None, "Method Not Allowed", 405), 405)
+
+        if identifier.get_full_name() not in self.table_metadata_store:
+            raise TableNotExistException(identifier)
+
+        from pypaimon.api.api_response import GetTableTokenResponse
+
+        token_key = identifier.get_full_name()
+        if token_key in self.table_token_store:
+            rest_token = self.table_token_store[token_key]
+            response = GetTableTokenResponse(
+                token=rest_token.token,
+                expires_at_millis=rest_token.expire_at_millis
+            )
+        else:
+            default_token = {
+                "akId": "akId" + str(int(time.time() * 1000)),
+                "akSecret": "akSecret" + str(int(time.time() * 1000))
+            }
+            response = GetTableTokenResponse(
+                token=default_token,
+                expires_at_millis=int(time.time() * 1000) + 3600_000  # 1 hour from now
+            )
+
+        return self._mock_response(response, 200)
+
+    def set_table_token(self, identifier: Identifier, token: "RESTToken") -> None:
+        self.table_token_store[identifier.get_full_name()] = token
+
+    def get_table_token(self, identifier: Identifier) -> Optional["RESTToken"]:
+        return self.table_token_store.get(identifier.get_full_name())
+
+    def reset_table_token(self, identifier: Identifier) -> None:
+        if identifier.get_full_name() in self.table_token_store:
+            del self.table_token_store[identifier.get_full_name()]
 
     def _table_commit_handle(self, method: str, data: str, identifier: Identifier,
                              branch: str = None) -> Tuple[str, int]:
@@ -664,6 +807,44 @@ class RESTCatalogServer:
                 regex.append(re.escape(char))
 
         return '^' + ''.join(regex) + '$'
+
+    def _alter_table_impl(self, identifier: Identifier, changes: List) -> None:
+        if identifier.get_full_name() not in self.table_metadata_store:
+            raise TableNotExistException(identifier)
+
+        schema_changes = []
+        for change in changes:
+            if isinstance(change, dict):
+                try:
+                    schema_changes.append(_dict_to_schema_change(change))
+                except (KeyError, TypeError) as e:
+                    raise ValueError(f"Failed to convert change dict to SchemaChange: {change}, error: {e}") from e
+            else:
+                schema_changes.append(change)
+
+        table_metadata = self.table_metadata_store[identifier.get_full_name()]
+
+        table_path = (
+            Path(self.data_path) / self.warehouse /
+            identifier.get_database_name() / identifier.get_object_name()
+        )
+        schema_manager = SchemaManager(self._get_file_io(), str(table_path))
+        new_schema = schema_manager.commit_changes(schema_changes)
+
+        updated_metadata = TableMetadata(
+            schema=new_schema,
+            is_external=table_metadata.is_external,
+            uuid=table_metadata.uuid
+        )
+        self.table_metadata_store[identifier.get_full_name()] = updated_metadata
+
+    def _get_file_io(self):
+        """Get FileIO instance for SchemaManager"""
+        from pypaimon.common.file_io import FileIO
+        from pypaimon.common.options import Options
+        warehouse_path = str(Path(self.data_path) / self.warehouse)
+        options = Options({"warehouse": warehouse_path})
+        return FileIO.get(warehouse_path, options)
 
     def _create_table_metadata(self, identifier: Identifier, schema_id: int,
                                schema: Schema, uuid_str: str, is_external: bool) -> TableMetadata:

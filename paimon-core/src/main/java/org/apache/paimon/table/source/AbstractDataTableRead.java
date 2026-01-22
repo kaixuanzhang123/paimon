@@ -18,8 +18,8 @@
 
 package org.apache.paimon.table.source;
 
+import org.apache.paimon.catalog.TableQueryAuthResult;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.data.variant.VariantAccessInfo;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateProjectionConverter;
@@ -43,8 +43,6 @@ public abstract class AbstractDataTableRead implements InnerTableRead {
     }
 
     public abstract void applyReadType(RowType readType);
-
-    public abstract void applyVariantAccess(VariantAccessInfo[] variantAccess);
 
     public abstract RecordReader<InternalRow> reader(Split split) throws IOException;
 
@@ -83,14 +81,18 @@ public abstract class AbstractDataTableRead implements InnerTableRead {
     }
 
     @Override
-    public InnerTableRead withVariantAccess(VariantAccessInfo[] variantAccessInfo) {
-        applyVariantAccess(variantAccessInfo);
-        return this;
-    }
-
-    @Override
     public final RecordReader<InternalRow> createReader(Split split) throws IOException {
+        TableQueryAuthResult queryAuthResult = null;
+        if (split instanceof QueryAuthSplit) {
+            QueryAuthSplit authSplit = (QueryAuthSplit) split;
+            split = authSplit.split();
+            queryAuthResult = authSplit.authResult();
+        }
         RecordReader<InternalRow> reader = reader(split);
+        if (queryAuthResult != null) {
+            RowType type = readType == null ? schema.logicalRowType() : readType;
+            reader = queryAuthResult.doAuth(reader, type);
+        }
         if (executeFilter) {
             reader = executeFilter(reader);
         }

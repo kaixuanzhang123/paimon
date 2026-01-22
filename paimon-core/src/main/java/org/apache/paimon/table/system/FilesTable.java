@@ -22,6 +22,7 @@ import org.apache.paimon.casting.CastExecutor;
 import org.apache.paimon.casting.CastExecutors;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalRow;
@@ -77,6 +78,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -117,7 +119,9 @@ public class FilesTable implements ReadonlyTable {
                             new DataField(14, "max_sequence_number", new BigIntType(true)),
                             new DataField(15, "creation_time", DataTypes.TIMESTAMP_MILLIS()),
                             new DataField(16, "deleteRowCount", DataTypes.BIGINT()),
-                            new DataField(17, "file_source", DataTypes.STRING())));
+                            new DataField(17, "file_source", DataTypes.STRING()),
+                            new DataField(18, "first_row_id", DataTypes.BIGINT()),
+                            new DataField(19, "write_cols", DataTypes.ARRAY(DataTypes.STRING()))));
 
     private final FileStoreTable storeTable;
 
@@ -280,6 +284,11 @@ public class FilesTable implements ReadonlyTable {
             }
             return scan.plan();
         }
+
+        @Override
+        public OptionalLong mergedRowCount() {
+            return OptionalLong.empty();
+        }
     }
 
     private static class FilesRead implements InnerTableRead {
@@ -435,7 +444,16 @@ public class FilesTable implements ReadonlyTable {
                         () -> file.deleteRowCount().orElse(null),
                         () ->
                                 BinaryString.fromString(
-                                        file.fileSource().map(FileSource::toString).orElse(null))
+                                        file.fileSource().map(FileSource::toString).orElse(null)),
+                        file::firstRowId,
+                        () -> {
+                            List<String> writeCols = file.writeCols();
+                            if (writeCols == null) {
+                                return null;
+                            }
+                            return new GenericArray(
+                                    writeCols.stream().map(BinaryString::fromString).toArray());
+                        },
                     };
 
             return new LazyGenericRow(fields);
