@@ -1,28 +1,29 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 """
 Module to write a Paimon table from a Ray Dataset, by using the Ray Datasink API.
 """
 
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from ray.data.datasource.datasink import Datasink, WriteResult
+from ray.data.datasource.datasink import Datasink
+
 from ray.util.annotations import DeveloperAPI
 from ray.data.block import BlockAccessor, Block
 from ray.data._internal.execution.interfaces import TaskContext
@@ -36,18 +37,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _cast_binary_to_table_schema(table: pa.Table, target_schema: pa.Schema) -> pa.Table:
+    """Cast binary to large_binary for BLOB fields.
+
+    When map_batches returns Python dicts, PyArrow infers bytes as binary,
+    losing the original large_binary (BLOB) type. Cast back before writing.
+    """
+    cast_indices = []
+    for i, field in enumerate(table.schema):
+        target_field = target_schema.field(field.name) if field.name in target_schema.names else None
+        if target_field and pa.types.is_binary(field.type) and pa.types.is_large_binary(target_field.type):
+            cast_indices.append(i)
+
+    if not cast_indices:
+        return table
+
+    columns = table.columns
+    for i in cast_indices:
+        columns[i] = columns[i].cast(pa.large_binary())
+    fields = [target_schema.field(f.name) if i in cast_indices else f
+              for i, f in enumerate(table.schema)]
+    return pa.table(columns, schema=pa.schema(fields))
+
+# Python 3.8 / Ray 2.10: Datasink is not subscriptable at runtime
+try:
+    _DatasinkBase = Datasink[List["CommitMessage"]]
+except TypeError:
+    _DatasinkBase = Datasink
+
+
 @DeveloperAPI
-class PaimonDatasink(Datasink[List["CommitMessage"]]):
+class PaimonDatasink(_DatasinkBase):
     def __init__(
         self,
         table: "Table",
         overwrite: bool = False,
+        static_partition: Optional[Dict[str, Any]] = None,
     ):
         self.table = table
         self.overwrite = overwrite
+        self.static_partition = static_partition
         self._table_name = table.identifier.get_full_name()
         self._writer_builder: Optional["WriteBuilder"] = None
         self._pending_commit_messages: List["CommitMessage"] = []
+
+    def _is_overwrite(self) -> bool:
+        return self.overwrite or self.static_partition is not None
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -60,13 +95,15 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
             self._writer_builder = None
         if not hasattr(self, '_table_name'):
             self._table_name = self.table.identifier.get_full_name()
+        if not hasattr(self, 'static_partition'):
+            self.static_partition = None
 
     def on_write_start(self, schema=None) -> None:
         logger.info(f"Starting write job for table {self._table_name}")
 
         self._writer_builder = self.table.new_batch_write_builder()
-        if self.overwrite:
-            self._writer_builder = self._writer_builder.overwrite()
+        if self._is_overwrite():
+            self._writer_builder = self._writer_builder.overwrite(self.static_partition)
 
     def write(
         self,
@@ -78,10 +115,14 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
 
         try:
             writer_builder = self.table.new_batch_write_builder()
-            if self.overwrite:
-                writer_builder = writer_builder.overwrite()
+            if self._is_overwrite():
+                writer_builder = writer_builder.overwrite(self.static_partition)
             
             table_write = writer_builder.new_write()
+
+            table_schema = self.table.table_schema
+            from pypaimon.schema.data_types import PyarrowFieldParser
+            target_pa_schema = PyarrowFieldParser.from_paimon_schema(table_schema.fields)
 
             for block in blocks:
                 block_arrow: pa.Table = BlockAccessor.for_block(block).to_arrow()
@@ -89,25 +130,50 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
                 if block_arrow.num_rows == 0:
                     continue
 
+                block_arrow = _cast_binary_to_table_schema(block_arrow, target_pa_schema)
+
                 table_write.write_arrow(block_arrow)
 
             commit_messages = table_write.prepare_commit()
             commit_messages_list.extend(commit_messages)
-        finally:
-            if table_write is not None:
-                table_write.close()
 
-        return commit_messages_list
+            table_write.close()
+            table_write = None
+            return commit_messages_list
+        except Exception:
+            if table_write is not None:
+                try:
+                    table_write.abort()
+                except Exception as abort_error:
+                    logger.warning(
+                        f"Error aborting worker-side table_write: {abort_error}",
+                        exc_info=abort_error
+                    )
+            raise
+
+    @staticmethod
+    def _extract_write_returns(write_result: Any):
+        """Normalize WriteResult.write_returns (Ray 2.44+) vs list of returns
+        (older Ray) into a list of per-task commit-message lists."""
+        if hasattr(write_result, "write_returns"):
+            return write_result.write_returns
+        if isinstance(write_result, list):
+            return write_result
+        raise TypeError(
+            f"Unexpected write_result type {type(write_result).__name__}: "
+            "expected object with .write_returns or list of commit message "
+            "lists. Refusing to proceed to avoid silent data loss."
+        )
 
     def on_write_complete(
-        self, write_result: WriteResult[List["CommitMessage"]]
+        self, write_result: Any
     ):
         table_commit = None
-        commit_messages_to_abort = []
         try:
+            write_returns = self._extract_write_returns(write_result)
             all_commit_messages = [
                 commit_message
-                for commit_messages in write_result.write_returns
+                for commit_messages in write_returns
                 for commit_message in commit_messages
             ]
 
@@ -117,7 +183,7 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
 
             self._pending_commit_messages = non_empty_messages
 
-            if not non_empty_messages:
+            if not non_empty_messages and not self._is_overwrite():
                 logger.info("No data to commit (all commit messages are empty)")
                 self._pending_commit_messages = []
                 return
@@ -128,10 +194,8 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
             )
 
             table_commit = self._writer_builder.new_commit()
-            commit_messages_to_abort = non_empty_messages
             table_commit.commit(non_empty_messages)
 
-            commit_messages_to_abort = []
             self._pending_commit_messages = []
 
             logger.info(f"Successfully committed write job for table {self._table_name}")
@@ -140,20 +204,8 @@ class PaimonDatasink(Datasink[List["CommitMessage"]]):
                 f"Error committing write job for table {self._table_name}: {e}",
                 exc_info=e
             )
-            if table_commit is not None and commit_messages_to_abort:
-                try:
-                    table_commit.abort(commit_messages_to_abort)
-                    logger.info(
-                        f"Aborted {len(commit_messages_to_abort)} commit messages "
-                        f"for table {self._table_name}"
-                    )
-                except Exception as abort_error:
-                    logger.error(
-                        f"Error aborting commit messages: {abort_error}",
-                        exc_info=abort_error
-                    )
-                finally:
-                    self._pending_commit_messages = []
+            if table_commit is not None:
+                self._pending_commit_messages = []
             raise
         finally:
             if table_commit is not None:

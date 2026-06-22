@@ -52,6 +52,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -168,6 +170,76 @@ public class PrimaryKeyFileStoreTableITCase extends AbstractTestBase {
     // ------------------------------------------------------------------------
     //  Constructed Tests
     // ------------------------------------------------------------------------
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testWriteOnlySnapshotSequenceNumberInitOverwritePreviousValue() throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().parallelism(1).build();
+        bEnv.executeSql(createCatalogSql("testCatalog", path));
+        bEnv.executeSql("USE CATALOG testCatalog");
+        bEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "  k INT,"
+                        + "  v STRING,"
+                        + "  PRIMARY KEY (k) NOT ENFORCED"
+                        + ") WITH ("
+                        + "  'bucket' = '1',"
+                        + "  'write-only' = 'true',"
+                        + "  'write.sequence-number-init-mode' = 'snapshot'"
+                        + ")");
+
+        bEnv.executeSql("INSERT INTO T VALUES (1, 'old'), (2, 'keep')").await();
+        bEnv.executeSql("INSERT INTO T VALUES (1, 'new')").await();
+
+        List<Row> actual = new ArrayList<>();
+        try (CloseableIterator<Row> it = bEnv.executeSql("SELECT * FROM T ORDER BY k").collect()) {
+            while (it.hasNext()) {
+                actual.add(it.next());
+            }
+        }
+
+        assertThat(actual).containsExactly(Row.of(1, "new"), Row.of(2, "keep"));
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testSnapshotSequenceInsertIntoCheckSameBucketAndInsertOverwriteRescale()
+            throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().parallelism(1).build();
+        bEnv.executeSql(createCatalogSql("testCatalog", path));
+        bEnv.executeSql("USE CATALOG testCatalog");
+        bEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "  k INT,"
+                        + "  v STRING,"
+                        + "  PRIMARY KEY (k) NOT ENFORCED"
+                        + ") WITH ("
+                        + "  'bucket' = '1',"
+                        + "  'write-only' = 'true',"
+                        + "  'write.sequence-number-init-mode' = 'snapshot'"
+                        + ")");
+
+        bEnv.executeSql("INSERT INTO T VALUES (1, 'AAA'), (2, 'BBB')").await();
+        bEnv.executeSql("ALTER TABLE T SET ('bucket' = '2')");
+
+        assertThatCode(() -> bEnv.executeSql("INSERT INTO T VALUES (3, 'CCC')").await())
+                .rootCause()
+                .isInstanceOf(RuntimeException.class)
+                .hasMessage(
+                        "Try to write table with a new bucket num 2, but the previous bucket num is 1. "
+                                + "Please switch to batch mode, and perform INSERT OVERWRITE to rescale current data layout first.");
+
+        bEnv.executeSql("INSERT OVERWRITE T VALUES (3, 'CCC'), (4, 'DDD')").await();
+
+        List<Row> actual = new ArrayList<>();
+        try (CloseableIterator<Row> it = bEnv.executeSql("SELECT * FROM T ORDER BY k").collect()) {
+            while (it.hasNext()) {
+                actual.add(it.next());
+            }
+        }
+
+        assertThat(actual).containsExactly(Row.of(3, "CCC"), Row.of(4, "DDD"));
+    }
 
     @Test
     @Timeout(TIMEOUT)
@@ -304,6 +376,66 @@ public class PrimaryKeyFileStoreTableITCase extends AbstractTestBase {
         }
 
         assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+    }
+
+    @Test
+    public void testTableReadWriteWithExternalPathWeightRobin() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths =
+                TraceableFileIO.SCHEME
+                        + "://"
+                        + externalPath1.toString()
+                        + ","
+                        + LocalFileIOLoader.SCHEME
+                        + "://"
+                        + externalPath2.toString();
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'write-only' = 'true',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'weight-robin',"
+                        + "'data-file.external-paths.weights' = '10,5'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        int fileNum = 30;
+        for (int i = 1; i <= fileNum; i++) {
+            sEnv.executeSql("INSERT INTO T2 VALUES (" + i + ", 'data" + i + "')").await();
+        }
+
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < fileNum; i++) {
+            actual.add(it.next().toString());
+        }
+        // Verify all data is readable
+        assertThat(actual).hasSize(fileNum);
+
+        long filesInPath1 = 0;
+        long filesInPath2 = 0;
+        try {
+            filesInPath1 = Files.list(Paths.get(externalPath1.toString() + "/bucket-0")).count();
+            filesInPath2 = Files.list(Paths.get(externalPath2.toString() + "/bucket-0")).count();
+
+        } catch (NoSuchFileException ignored) {
+        }
+        long totalFiles = filesInPath1 + filesInPath2;
+
+        // Since the file sample size is small in IT case, we only verify the writing and reading
+        // For tests on file distribution by weights, see WeightedExternalPathProviderTest
+        assertThat(totalFiles).isEqualTo(fileNum);
     }
 
     @Test
@@ -904,7 +1036,8 @@ public class PrimaryKeyFileStoreTableITCase extends AbstractTestBase {
         // branch1 is fallback branch, can not be deleted
         assertThatCode(() -> bEnv.executeSql("CALL sys.delete_branch('default.t', 'branch1')"))
                 .rootCause()
-                .hasMessageContaining("can not delete the fallback branch.");
+                .hasMessageContaining(
+                        "Cannot delete branch 'branch1' because it is configured as 'scan.fallback-branch'.");
 
         // reset scan.fallback-branch
         bEnv.executeSql("ALTER TABLE t RESET ('scan.fallback-branch')");

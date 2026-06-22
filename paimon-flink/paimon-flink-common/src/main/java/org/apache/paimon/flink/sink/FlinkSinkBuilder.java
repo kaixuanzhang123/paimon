@@ -27,6 +27,10 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.FlinkRowWrapper;
 import org.apache.paimon.flink.sink.index.GlobalDynamicBucketSink;
+import org.apache.paimon.flink.sink.partition.DataStatisticsOperatorFactory;
+import org.apache.paimon.flink.sink.partition.StatisticsOrRecord;
+import org.apache.paimon.flink.sink.partition.StatisticsOrRecordChannelComputer;
+import org.apache.paimon.flink.sink.partition.StatisticsOrRecordTypeInfo;
 import org.apache.paimon.flink.sorter.TableSortInfo;
 import org.apache.paimon.flink.sorter.TableSorter;
 import org.apache.paimon.table.BucketMode;
@@ -34,6 +38,7 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.PostponeUtils;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.ChannelComputer;
+import org.apache.paimon.utils.BlobDescriptorUtils;
 
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -206,13 +211,17 @@ public class FlinkSinkBuilder {
     public DataStreamSink<?> build() {
         setParallelismIfAdaptiveConflict();
         input = trySortInput(input);
-        boolean blobAsDescriptor = table.coreOptions().blobAsDescriptor();
+        CatalogContext contextForDescriptor =
+                BlobDescriptorUtils.getCatalogContext(
+                        table.catalogEnvironment().catalogContext(),
+                        table.coreOptions().toConfiguration());
+
         DataStream<InternalRow> input =
                 mapToInternalRow(
                         this.input,
                         table.rowType(),
-                        blobAsDescriptor,
-                        table.catalogEnvironment().catalogContext());
+                        contextForDescriptor,
+                        table.coreOptions().blobWriteNullOnMissingFile());
         if (table.coreOptions().localMergeEnabled() && table.schema().primaryKeys().size() > 0) {
             SingleOutputStreamOperator<InternalRow> newInput =
                     input.forward()
@@ -244,14 +253,23 @@ public class FlinkSinkBuilder {
     public static DataStream<InternalRow> mapToInternalRow(
             DataStream<RowData> input,
             org.apache.paimon.types.RowType rowType,
-            boolean blobAsDescriptor,
             CatalogContext catalogContext) {
+        return mapToInternalRow(input, rowType, catalogContext, false);
+    }
+
+    public static DataStream<InternalRow> mapToInternalRow(
+            DataStream<RowData> input,
+            org.apache.paimon.types.RowType rowType,
+            CatalogContext catalogContext,
+            boolean checkBlobDescriptorExists) {
         SingleOutputStreamOperator<InternalRow> result =
                 input.map(
                                 (MapFunction<RowData, InternalRow>)
                                         r ->
                                                 new FlinkRowWrapper(
-                                                        r, blobAsDescriptor, catalogContext))
+                                                        r,
+                                                        catalogContext,
+                                                        checkBlobDescriptorExists))
                         .returns(
                                 org.apache.paimon.flink.utils.InternalTypeInfo.fromRowType(
                                         rowType));
@@ -321,23 +339,61 @@ public class FlinkSinkBuilder {
                 table.primaryKeys().isEmpty(),
                 "Unaware bucket mode only works with append-only table for now.");
 
-        if (!table.partitionKeys().isEmpty()
-                && table.coreOptions().partitionSinkStrategy() == PartitionSinkStrategy.HASH) {
-            input =
-                    partition(
-                            input,
-                            new RowDataHashPartitionChannelComputer(table.schema()),
-                            parallelism);
+        if (!table.partitionKeys().isEmpty()) {
+            PartitionSinkStrategy strategy = table.coreOptions().partitionSinkStrategy();
+            if (strategy == PartitionSinkStrategy.HASH) {
+                input =
+                        partition(
+                                input,
+                                new RowDataHashPartitionChannelComputer(table.schema()),
+                                parallelism);
+            } else if (strategy == PartitionSinkStrategy.PARTITION_DYNAMIC) {
+                input = applyDynamicPartitionShuffle(input);
+            }
         }
 
         return new RowAppendTableSink(table, overwritePartition, parallelism).sinkFrom(input);
+    }
+
+    private DataStream<InternalRow> applyDynamicPartitionShuffle(DataStream<InternalRow> input) {
+        StatisticsOrRecordTypeInfo typeInfo =
+                new StatisticsOrRecordTypeInfo(table.schema().logicalRowType());
+        SingleOutputStreamOperator<StatisticsOrRecord> statsStream =
+                input.transform(
+                                "Collect Statistics: " + table.name(),
+                                typeInfo,
+                                new DataStatisticsOperatorFactory(table.schema()))
+                        .setParallelism(input.getParallelism());
+
+        DataStream<StatisticsOrRecord> partitioned =
+                partition(
+                        statsStream,
+                        new StatisticsOrRecordChannelComputer(table.schema()),
+                        parallelism);
+
+        return partitioned
+                .flatMap(
+                        (org.apache.flink.api.common.functions.FlatMapFunction<
+                                        StatisticsOrRecord, InternalRow>)
+                                (statisticsOrRecord, out) -> {
+                                    if (statisticsOrRecord.isRecord()) {
+                                        out.collect(statisticsOrRecord.record());
+                                    }
+                                })
+                .name("Strip Statistics")
+                .setParallelism(parallelism != null ? parallelism : input.getParallelism())
+                .returns(input.getType());
     }
 
     private DataStream<RowData> trySortInput(DataStream<RowData> input) {
         if (tableSortInfo != null) {
             TableSorter sorter =
                     TableSorter.getSorter(
-                            input.getExecutionEnvironment(), input, table, tableSortInfo);
+                            input.getExecutionEnvironment(),
+                            input,
+                            table.coreOptions(),
+                            table.rowType(),
+                            tableSortInfo);
             return sorter.sort();
         }
         return input;

@@ -1,27 +1,28 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from pathlib import Path
+from typing import Optional
 
 import pyarrow as pa
-from pathlib import Path
 
 from pypaimon.write.blob_format_writer import BlobFormatWriter
 from pypaimon.table.row.generic_row import GenericRow, RowKind
-from pypaimon.table.row.blob import Blob, BlobData, BlobDescriptor
+from pypaimon.table.row.blob import Blob, BlobConsumer, BlobData, BlobDescriptor
 from pypaimon.schema.data_types import DataField, PyarrowFieldParser
 
 
@@ -31,12 +32,16 @@ class BlobFileWriter:
     Writes rows one by one and tracks file size.
     """
 
-    def __init__(self, file_io, file_path: Path, blob_as_descriptor: bool):
+    def __init__(self, file_io, file_path: Path, blob_consumer: Optional[BlobConsumer] = None):
         self.file_io = file_io
         self.file_path = file_path
-        self.blob_as_descriptor = blob_as_descriptor
+        self._blob_consumer = blob_consumer
         self.output_stream = file_io.new_output_stream(file_path)
-        self.writer = BlobFormatWriter(self.output_stream)
+        self.writer = BlobFormatWriter(
+            self.output_stream,
+            blob_consumer=blob_consumer,
+            file_path=str(file_path),
+        )
         self.row_count = 0
         self.closed = False
 
@@ -50,41 +55,61 @@ class BlobFileWriter:
         field_name = row_data.schema[0].name
         col_data = records_dict[field_name][0]
 
-        # Convert to Blob
-        if self.blob_as_descriptor:
-            # In blob-as-descriptor mode, we need to read external file data
-            # for rolling size calculation (based on external file size)
-            if isinstance(col_data, bytes):
-                blob_descriptor = BlobDescriptor.deserialize(col_data)
-            else:
-                # Handle PyArrow types
-                if hasattr(col_data, 'as_py'):
-                    col_data = col_data.as_py()
-                if isinstance(col_data, str):
-                    col_data = col_data.encode('utf-8')
-                blob_descriptor = BlobDescriptor.deserialize(col_data)
-            # Read external file data for rolling size calculation
-            uri_reader = self.file_io.uri_reader_factory.create(blob_descriptor.uri)
-            blob_data = Blob.from_descriptor(uri_reader, blob_descriptor)
-        elif isinstance(col_data, bytes):
-            blob_data = BlobData(col_data)
-        else:
-            if hasattr(col_data, 'as_py'):
-                col_data = col_data.as_py()
-            if isinstance(col_data, str):
-                col_data = col_data.encode('utf-8')
-            blob_data = BlobData(col_data)
+        blob_data = self._to_blob(col_data)
 
-        # Create GenericRow
-        fields = [DataField(0, field_name, PyarrowFieldParser.to_paimon_type(row_data.schema[0].type, False))]
+        self.write_blob(field_name, row_data.schema[0].type, blob_data)
+
+    def write_blob(self, field_name: str, arrow_type, blob_data):
+        blob_data = self._to_blob(blob_data)
+        fields = [
+            DataField(
+                0,
+                field_name,
+                PyarrowFieldParser.to_paimon_type(arrow_type, False),
+            )
+        ]
         row = GenericRow([blob_data], fields, RowKind.INSERT)
 
         # Write to blob format writer
         self.writer.add_element(row)
         self.row_count += 1
 
-    def reach_target_size(self, suggested_check: bool, target_size: int) -> bool:
-        return self.writer.reach_target_size(suggested_check, target_size)
+    def _to_blob(self, col_data) -> Optional[Blob]:
+        if col_data is Blob.PLACE_HOLDER:
+            return Blob.PLACE_HOLDER
+        if hasattr(col_data, 'as_py'):
+            col_data = col_data.as_py()
+        if col_data is None:
+            return None
+        if isinstance(col_data, str):
+            col_data = col_data.encode('utf-8')
+        if isinstance(col_data, bytearray):
+            col_data = bytes(col_data)
+
+        if isinstance(col_data, Blob):
+            return col_data
+
+        if isinstance(col_data, bytes):
+            if BlobDescriptor.is_blob_descriptor(col_data):
+                descriptor = BlobDescriptor.deserialize(col_data)
+                uri_reader = self.file_io.uri_reader_factory.create(descriptor.uri)
+                return Blob.from_descriptor(uri_reader, descriptor)
+            else:
+                return BlobData(col_data)
+
+        raise ValueError(
+            "Blob field value must be bytes/blob or serialized BlobDescriptor bytes, "
+            f"got {type(col_data)}."
+        )
+
+    @staticmethod
+    def _deserialize_descriptor_or_none(raw: bytes):
+        if not BlobDescriptor.is_blob_descriptor(raw):
+            return None
+        return BlobDescriptor.deserialize(raw)
+
+    def reach_target_size(self, target_size: int) -> bool:
+        return self.writer.reach_target_size(target_size)
 
     def close(self) -> int:
         if self.closed:
@@ -98,7 +123,7 @@ class BlobFileWriter:
         return file_size
 
     def abort(self):
-        """Abort the writer and delete the file."""
+        """Abort the writer and delete the file (unless a blob consumer holds references)."""
         if not self.closed:
             try:
                 if hasattr(self.output_stream, 'close'):
@@ -107,5 +132,5 @@ class BlobFileWriter:
                 pass
             self.closed = True
 
-        # Delete the file
-        self.file_io.delete_quietly(self.file_path)
+        if self._blob_consumer is None:
+            self.file_io.delete_quietly(self.file_path)

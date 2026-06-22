@@ -56,8 +56,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -68,6 +70,7 @@ import static org.apache.paimon.options.CatalogOptions.CACHE_EXPIRE_AFTER_ACCESS
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_MAX_MEMORY;
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SMALL_FILE_MEMORY;
 import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SMALL_FILE_THRESHOLD;
+import static org.apache.paimon.options.CatalogOptions.CACHE_MANIFEST_SOFT_VALUES;
 import static org.apache.paimon.options.CatalogOptions.CACHE_PARTITION_MAX_NUM;
 import static org.apache.paimon.options.CatalogOptions.CACHE_SNAPSHOT_MAX_NUM_PER_TABLE;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -173,6 +176,45 @@ class CachingCatalogTest extends CatalogTestBase {
                 .hasMessage("Table db.tbl$branch_b1 does not exist.");
         assertThatThrownBy(() -> catalog.getTable(branchSysIdent))
                 .hasMessage("Table db.tbl$branch_b1 does not exist.");
+    }
+
+    @Test
+    public void testConcurrentGetTableLoadsTableOnce() throws Exception {
+        Catalog wrapped = Mockito.mock(Catalog.class);
+        CachingCatalog catalog = new CachingCatalog(wrapped, new Options());
+        Identifier tableIdent = new Identifier("db", "tbl");
+        Table table = Mockito.mock(Table.class);
+        AtomicInteger loadCount = new AtomicInteger();
+        CountDownLatch loadStarted = new CountDownLatch(1);
+        CountDownLatch releaseLoad = new CountDownLatch(1);
+        when(wrapped.getTable(tableIdent))
+                .thenAnswer(
+                        invocation -> {
+                            loadCount.incrementAndGet();
+                            loadStarted.countDown();
+                            assertThat(releaseLoad.await(10, TimeUnit.SECONDS)).isTrue();
+                            return table;
+                        });
+
+        int numThreads = 8;
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+        try {
+            List<Future<Table>> futures = new ArrayList<>();
+            for (int i = 0; i < numThreads; i++) {
+                futures.add(executor.submit(() -> catalog.getTable(tableIdent)));
+            }
+
+            assertThat(loadStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            releaseLoad.countDown();
+
+            for (Future<Table> future : futures) {
+                assertThat(future.get(10, TimeUnit.SECONDS)).isSameAs(table);
+            }
+            assertThat(loadCount).hasValue(1);
+        } finally {
+            releaseLoad.countDown();
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -496,5 +538,16 @@ class CachingCatalogTest extends CatalogTestBase {
         caching = (CachingCatalog) CachingCatalog.tryToCreate(catalog, options);
         assertThat(caching.manifestCache.maxMemorySize()).isEqualTo(MemorySize.ofMebiBytes(256));
         assertThat(caching.manifestCache.maxElementSize()).isEqualTo(Long.MAX_VALUE);
+
+        // soft values default to on and the manifest cache inherits the catalog idle TTL
+        assertThat(caching.manifestCache.softValues()).isTrue();
+        assertThat(caching.manifestCache.ttl()).isEqualTo(CACHE_EXPIRE_AFTER_ACCESS.defaultValue());
+
+        // soft values can be turned off to opt into strong references; the cache still inherits
+        // the catalog idle TTL
+        options.set(CACHE_MANIFEST_SOFT_VALUES, false);
+        caching = (CachingCatalog) CachingCatalog.tryToCreate(catalog, options);
+        assertThat(caching.manifestCache.softValues()).isFalse();
+        assertThat(caching.manifestCache.ttl()).isEqualTo(CACHE_EXPIRE_AFTER_ACCESS.defaultValue());
     }
 }

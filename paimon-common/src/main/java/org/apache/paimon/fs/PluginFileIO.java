@@ -27,7 +27,7 @@ import java.io.IOException;
  * A {@link FileIO} for plugin jar. {@link FileIO} is serializable, so plugin FileIO should be
  * transient.
  */
-public abstract class PluginFileIO implements FileIO {
+public abstract class PluginFileIO implements FileIO, HadoopOptionsProvider {
 
     private static final long serialVersionUID = 1L;
 
@@ -43,6 +43,11 @@ public abstract class PluginFileIO implements FileIO {
     }
 
     public Options options() {
+        return options;
+    }
+
+    @Override
+    public Options hadoopOptions(Path path, String opType) {
         return options;
     }
 
@@ -84,6 +89,11 @@ public abstract class PluginFileIO implements FileIO {
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
         return wrap(() -> fileIO(src).rename(src, dst));
+    }
+
+    @Override
+    public boolean tryToWriteAtomic(Path path, String content) throws IOException {
+        return wrap(() -> fileIO(path).tryToWriteAtomic(path, content));
     }
 
     private FileIO fileIO(Path path) throws IOException {

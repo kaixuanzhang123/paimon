@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import glob
 import os
@@ -38,7 +37,6 @@ from pypaimon.manifest.schema.simple_stats import SimpleStats
 from pypaimon.schema.data_types import (ArrayType, AtomicType, DataField,
                                         MapType, PyarrowFieldParser)
 from pypaimon.schema.table_schema import TableSchema
-from pypaimon.snapshot.snapshot_manager import SnapshotManager
 from pypaimon.table.row.generic_row import GenericRow, GenericRowDeserializer
 from pypaimon.write.file_store_commit import FileStoreCommit
 
@@ -163,6 +161,71 @@ class ReaderBasicTest(unittest.TestCase):
         pd.testing.assert_frame_equal(
             actual_df2.reset_index(drop=True), df2.reset_index(drop=True))
 
+    def test_dynamic_partition_overwrite(self):
+        pa_schema = pa.schema([
+            ('f0', pa.string()),
+            ('f1', pa.string())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, partition_keys=['f0'])
+        self.catalog.create_table('default.test_dynamic_overwrite', schema, False)
+        table = self.catalog.get_table('default.test_dynamic_overwrite')
+        read_builder = table.new_read_builder()
+
+        # Write initial non-null and null partitions
+        self._batch_write(table, pd.DataFrame({
+            'f0': ['a', 'b', None],
+            'f1': ['apple', 'banana', 'cherry'],
+        }))
+
+        # Dynamic overwrite partition f0='a' only; 'b' and null untouched
+        self._batch_overwrite(table, pd.DataFrame({
+            'f0': ['a'],
+            'f1': ['watermelon'],
+        }))
+
+        self._assert_table_equals(read_builder, pd.DataFrame({
+            'f0': ['a', 'b', None],
+            'f1': ['watermelon', 'banana', 'cherry'],
+        }), sort_by='f0')
+
+        # Dynamic overwrite partitions f0='a' and f0=None; 'b' untouched
+        self._batch_overwrite(table, pd.DataFrame({
+            'f0': ['a', None],
+            'f1': ['mango', 'grape'],
+        }))
+
+        self._assert_table_equals(read_builder, pd.DataFrame({
+            'f0': ['a', 'b', None],
+            'f1': ['mango', 'banana', 'grape'],
+        }), sort_by='f0')
+
+    def _batch_write(self, table, df):
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_pandas(df)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+    def _batch_overwrite(self, table, df, partition=None):
+        write_builder = table.new_batch_write_builder().overwrite(partition)
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_pandas(df)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+    def _assert_table_equals(self, read_builder, expected_df, sort_by=None):
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        actual_df = table_read.to_pandas(table_scan.plan().splits())
+        if sort_by:
+            actual_df = actual_df.sort_values(by=sort_by)
+        pd.testing.assert_frame_equal(
+            actual_df.reset_index(drop=True), expected_df.reset_index(drop=True))
+
     def test_full_data_types(self):
         simple_pa_schema = pa.schema([
             ('f0', pa.int8()),
@@ -178,7 +241,7 @@ class ReaderBasicTest(unittest.TestCase):
             ('f10', pa.decimal128(10, 2)),
             ('f11', pa.timestamp('ms')),
             ('f12', pa.date32()),
-            ('f13', pa.time64('us')),
+            ('f13', pa.time32('ms')),
         ])
         stats_enabled = random.random() < 0.5
         options = {'metadata.stats-mode': 'full'} if stats_enabled else {}
@@ -223,13 +286,18 @@ class ReaderBasicTest(unittest.TestCase):
 
         # assert equal
         actual_data = table_read.to_arrow(splits)
-        self.assertEqual(actual_data, expect_data)
+        # BINARY(N) maps to variable-length binary on read (see #7518), so the
+        # fixed-size f9 column normalizes to binary; reflect that in the expected.
+        f9_index = expect_data.schema.get_field_index('f9')
+        expected_data = expect_data.set_column(
+            f9_index, 'f9', expect_data.column('f9').cast(pa.binary()))
+        self.assertEqual(actual_data, expected_data)
 
         # to test GenericRow ability
-        latest_snapshot = SnapshotManager(table).get_latest_snapshot()
-        manifest_files = table_scan.starting_scanner.manifest_list_manager.read_all(latest_snapshot)
-        manifest_entries = table_scan.starting_scanner.manifest_file_manager.read(
-            manifest_files[0].file_name, lambda row: table_scan.starting_scanner._filter_manifest_entry(row), False)
+        latest_snapshot = table.snapshot_manager().get_latest_snapshot()
+        manifest_files = table_scan.file_scanner.manifest_list_manager.read_all(latest_snapshot)
+        manifest_entries = table_scan.file_scanner.manifest_file_manager.read(
+            manifest_files[0].file_name, lambda row: table_scan.file_scanner._filter_manifest_entry(row), False)
 
         # Python write does not produce value stats
         if stats_enabled:
@@ -488,6 +556,11 @@ class ReaderBasicTest(unittest.TestCase):
             ('name', pa.string()),
             ('price', pa.float64()),
         ])
+        pk_write_schema = pa.schema([
+            pa.field('id', pa.int64(), nullable=False),
+            ('name', pa.string()),
+            ('price', pa.float64()),
+        ])
         pk_schema = Schema.from_pyarrow_schema(
             pk_pa_schema,
             primary_keys=['id'],
@@ -500,7 +573,7 @@ class ReaderBasicTest(unittest.TestCase):
             'id': [1, 2, 3],
             'name': ['Alice', 'Bob', 'Charlie'],
             'price': [10.5, 20.3, 30.7],
-        }, schema=pk_pa_schema)
+        }, schema=pk_write_schema)
 
         pk_write_builder = pk_table.new_batch_write_builder()
         pk_writer = pk_write_builder.new_write()
@@ -512,11 +585,11 @@ class ReaderBasicTest(unittest.TestCase):
 
         pk_read_builder = pk_table.new_read_builder()
         pk_table_scan = pk_read_builder.new_scan()
-        latest_snapshot = SnapshotManager(pk_table).get_latest_snapshot()
-        pk_manifest_files = pk_table_scan.starting_scanner.manifest_list_manager.read_all(latest_snapshot)
-        pk_manifest_entries = pk_table_scan.starting_scanner.manifest_file_manager.read(
+        latest_snapshot = pk_table.snapshot_manager().get_latest_snapshot()
+        pk_manifest_files = pk_table_scan.file_scanner.manifest_list_manager.read_all(latest_snapshot)
+        pk_manifest_entries = pk_table_scan.file_scanner.manifest_file_manager.read(
             pk_manifest_files[0].file_name,
-            lambda row: pk_table_scan.starting_scanner._filter_manifest_entry(row),
+            lambda row: pk_table_scan.file_scanner._filter_manifest_entry(row),
             False
         )
 
@@ -530,7 +603,7 @@ class ReaderBasicTest(unittest.TestCase):
                          f"table.fields should NOT contain system fields, but got: {pk_table_field_names}")
 
         if pk_file_meta.value_stats_cols is None:
-            pk_value_stats_fields = pk_table_scan.starting_scanner.manifest_file_manager._get_value_stats_fields(
+            pk_value_stats_fields = pk_table_scan.file_scanner.manifest_file_manager._get_value_stats_fields(
                 {'_VALUE_STATS_COLS': None},
                 pk_table.fields
             )
@@ -558,6 +631,11 @@ class ReaderBasicTest(unittest.TestCase):
             ('name', pa.string()),
             ('price', pa.float64()),
         ])
+        pk_pa_schema = pa.schema([
+            pa.field('id', pa.int64(), nullable=False),
+            ('name', pa.string()),
+            ('price', pa.float64()),
+        ])
         schema = Schema.from_pyarrow_schema(
             pa_schema,
             primary_keys=['id'],
@@ -570,7 +648,7 @@ class ReaderBasicTest(unittest.TestCase):
             'id': [1, 2, 3],
             'name': ['Alice', 'Bob', 'Charlie'],
             'price': [10.5, 20.3, 30.7],
-        }, schema=pa_schema)
+        }, schema=pk_pa_schema)
 
         write_builder = table.new_batch_write_builder()
         writer = write_builder.new_write()
@@ -582,11 +660,11 @@ class ReaderBasicTest(unittest.TestCase):
 
         read_builder = table.new_read_builder()
         table_scan = read_builder.new_scan()
-        latest_snapshot = SnapshotManager(table).get_latest_snapshot()
-        manifest_files = table_scan.starting_scanner.manifest_list_manager.read_all(latest_snapshot)
-        manifest_entries = table_scan.starting_scanner.manifest_file_manager.read(
+        latest_snapshot = table.snapshot_manager().get_latest_snapshot()
+        manifest_files = table_scan.file_scanner.manifest_list_manager.read_all(latest_snapshot)
+        manifest_entries = table_scan.file_scanner.manifest_file_manager.read(
             manifest_files[0].file_name,
-            lambda row: table_scan.starting_scanner._filter_manifest_entry(row),
+            lambda row: table_scan.file_scanner._filter_manifest_entry(row),
             False
         )
 
@@ -635,14 +713,14 @@ class ReaderBasicTest(unittest.TestCase):
             DataField(5, "f5", AtomicType('DOUBLE'), 'desc'),
             DataField(6, "f6", AtomicType('BOOLEAN'), 'desc'),
             DataField(7, "f7", AtomicType('STRING'), 'desc'),
-            DataField(8, "f8", AtomicType('BINARY(12)'), 'desc'),
+            DataField(8, "f8", AtomicType('BYTES'), 'desc'),
             DataField(9, "f9", AtomicType('DECIMAL(10, 6)'), 'desc'),
             DataField(10, "f10", AtomicType('BYTES'), 'desc'),
             DataField(11, "f11", AtomicType('DATE'), 'desc'),
             DataField(12, "f12", AtomicType('TIME(0)'), 'desc'),
-            DataField(13, "f13", AtomicType('TIME(3)'), 'desc'),
-            DataField(14, "f14", AtomicType('TIME(6)'), 'desc'),
-            DataField(15, "f15", AtomicType('TIME(9)'), 'desc'),
+            DataField(13, "f13", AtomicType('TIME(0)'), 'desc'),
+            DataField(14, "f14", AtomicType('TIME(0)'), 'desc'),
+            DataField(15, "f15", AtomicType('TIME(0)'), 'desc'),
             DataField(16, "f16", AtomicType('TIMESTAMP(0)'), 'desc'),
             DataField(17, "f17", AtomicType('TIMESTAMP(3)'), 'desc'),
             DataField(18, "f18", AtomicType('TIMESTAMP(6)'), 'desc'),
@@ -1047,6 +1125,12 @@ class ReaderBasicTest(unittest.TestCase):
             ('price', pa.float64()),
             ('category', pa.string())
         ])
+        pk_pa_schema = pa.schema([
+            pa.field('id', pa.int64(), nullable=False),
+            ('name', pa.string()),
+            ('price', pa.float64()),
+            ('category', pa.string())
+        ])
         schema = Schema.from_pyarrow_schema(
             pa_schema,
             primary_keys=['id'],
@@ -1060,7 +1144,7 @@ class ReaderBasicTest(unittest.TestCase):
             'name': ['Alice', 'Bob', 'Charlie', 'David', 'Eve'],
             'price': [10.5, 20.3, 30.7, 40.1, 50.9],
             'category': ['A', 'B', 'C', 'D', 'E']
-        }, schema=pa_schema)
+        }, schema=pk_pa_schema)
 
         write_builder = table.new_batch_write_builder()
         writer = write_builder.new_write()
@@ -1089,11 +1173,11 @@ class ReaderBasicTest(unittest.TestCase):
         # Read manifest to verify value_stats_cols is None (all fields included)
         read_builder = table.new_read_builder()
         table_scan = read_builder.new_scan()
-        latest_snapshot = SnapshotManager(table).get_latest_snapshot()
-        manifest_files = table_scan.starting_scanner.manifest_list_manager.read_all(latest_snapshot)
-        manifest_entries = table_scan.starting_scanner.manifest_file_manager.read(
+        latest_snapshot = table.snapshot_manager().get_latest_snapshot()
+        manifest_files = table_scan.file_scanner.manifest_list_manager.read_all(latest_snapshot)
+        manifest_entries = table_scan.file_scanner.manifest_file_manager.read(
             manifest_files[0].file_name,
-            lambda row: table_scan.starting_scanner._filter_manifest_entry(row),
+            lambda row: table_scan.file_scanner._filter_manifest_entry(row),
             False
         )
 
@@ -1146,7 +1230,7 @@ class ReaderBasicTest(unittest.TestCase):
                 self.assertFalse(is_system_field,
                                  f"value_stats_cols should not contain system field: {field_name}")
             
-            value_stats_fields = table_scan.starting_scanner.manifest_file_manager._get_value_stats_fields(
+            value_stats_fields = table_scan.file_scanner.manifest_file_manager._get_value_stats_fields(
                 {'_VALUE_STATS_COLS': file_meta.value_stats_cols},
                 table.fields
             )

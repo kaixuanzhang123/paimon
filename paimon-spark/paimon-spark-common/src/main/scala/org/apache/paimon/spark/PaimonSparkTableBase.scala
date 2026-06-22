@@ -22,7 +22,7 @@ import org.apache.paimon.CoreOptions
 import org.apache.paimon.CoreOptions.BucketFunctionType
 import org.apache.paimon.options.Options
 import org.apache.paimon.spark.catalog.functions.BucketFunction
-import org.apache.paimon.spark.scan.PaimonSplitScanBuilder
+import org.apache.paimon.spark.read.PaimonSplitScanBuilder
 import org.apache.paimon.spark.schema.PaimonMetadataColumn
 import org.apache.paimon.spark.util.OptionUtils
 import org.apache.paimon.spark.write.{PaimonV2WriteBuilder, PaimonWriteBuilder}
@@ -92,17 +92,18 @@ abstract class PaimonSparkTableBase(val table: Table)
   override def capabilities: JSet[TableCapability] = {
     val capabilities = JEnumSet.of(
       TableCapability.BATCH_READ,
-      TableCapability.OVERWRITE_BY_FILTER,
       TableCapability.MICRO_BATCH_READ
     )
 
     if (useV2Write) {
       capabilities.add(TableCapability.ACCEPT_ANY_SCHEMA)
       capabilities.add(TableCapability.BATCH_WRITE)
+      capabilities.add(TableCapability.OVERWRITE_BY_FILTER)
       capabilities.add(TableCapability.OVERWRITE_DYNAMIC)
     } else {
       capabilities.add(TableCapability.ACCEPT_ANY_SCHEMA)
       capabilities.add(TableCapability.V1_BATCH_WRITE)
+      capabilities.add(TableCapability.OVERWRITE_BY_FILTER)
     }
 
     capabilities
@@ -116,6 +117,13 @@ abstract class PaimonSparkTableBase(val table: Table)
     if (coreOptions.rowTrackingEnabled()) {
       _metadataColumns.append(PaimonMetadataColumn.ROW_ID)
       _metadataColumns.append(PaimonMetadataColumn.SEQUENCE_NUMBER)
+    }
+    if (
+      table.isInstanceOf[VectorSearchTable] ||
+      table.isInstanceOf[HybridSearchTable] ||
+      table.isInstanceOf[FullTextSearchTable]
+    ) {
+      _metadataColumns.append(PaimonMetadataColumn.SEARCH_SCORE)
     }
 
     _metadataColumns.appendAll(

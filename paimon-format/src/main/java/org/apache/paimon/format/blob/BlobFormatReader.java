@@ -19,6 +19,7 @@
 package org.apache.paimon.format.blob;
 
 import org.apache.paimon.data.Blob;
+import org.apache.paimon.data.BlobPlaceholder;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.FileIO;
@@ -40,16 +41,25 @@ public class BlobFormatReader implements FileRecordReader<InternalRow> {
     private final String filePathString;
     private final BlobFileMeta fileMeta;
     private final @Nullable SeekableInputStream in;
+    private final int fieldCount;
+    private final int blobIndex;
 
     private boolean returned;
 
     public BlobFormatReader(
-            FileIO fileIO, Path filePath, BlobFileMeta fileMeta, @Nullable SeekableInputStream in) {
+            FileIO fileIO,
+            Path filePath,
+            BlobFileMeta fileMeta,
+            @Nullable SeekableInputStream in,
+            int fieldCount,
+            int blobIndex) {
         this.fileIO = fileIO;
         this.filePath = filePath;
         this.filePathString = filePath.toString();
         this.fileMeta = fileMeta;
         this.in = in;
+        this.fieldCount = fieldCount;
+        this.blobIndex = blobIndex;
         this.returned = false;
     }
 
@@ -83,15 +93,23 @@ public class BlobFormatReader implements FileRecordReader<InternalRow> {
                 }
 
                 Blob blob;
-                long offset = fileMeta.blobOffset(currentPosition) + 4;
-                long length = fileMeta.blobLength(currentPosition) - 16;
-                if (in != null) {
-                    blob = Blob.fromData(readInlineBlob(in, offset, length));
+                if (fileMeta.isNull(currentPosition)) {
+                    blob = null;
+                } else if (fileMeta.isPlaceHolder(currentPosition)) {
+                    blob = BlobPlaceholder.INSTANCE;
                 } else {
-                    blob = Blob.fromFile(fileIO, filePathString, offset, length);
+                    long offset = fileMeta.blobOffset(currentPosition) + 4;
+                    long length = fileMeta.blobLength(currentPosition) - 16;
+                    if (in != null) {
+                        blob = Blob.fromData(readInlineBlob(in, offset, length));
+                    } else {
+                        blob = Blob.fromFile(fileIO, filePathString, offset, length);
+                    }
                 }
                 currentPosition++;
-                return GenericRow.of(blob);
+                GenericRow row = new GenericRow(fieldCount);
+                row.setField(blobIndex, blob);
+                return row;
             }
 
             @Override

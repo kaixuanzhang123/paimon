@@ -23,6 +23,7 @@ import org.apache.paimon.io.DataInputDeserializer;
 import org.apache.paimon.io.DataInputView;
 import org.apache.paimon.io.DataOutputSerializer;
 import org.apache.paimon.io.DataOutputView;
+import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.RoaringNavigableMap64;
 
 import java.io.IOException;
@@ -66,11 +67,10 @@ public class GlobalIndexResultSerializer implements Serializer<GlobalIndexResult
         dataOutput.writeInt(bytes.length);
         dataOutput.write(bytes);
 
-        if (globalIndexResult instanceof VectorSearchGlobalIndexResult) {
-            VectorSearchGlobalIndexResult vectorSearchGlobalIndexResult =
-                    (VectorSearchGlobalIndexResult) globalIndexResult;
+        if (globalIndexResult instanceof ScoredGlobalIndexResult) {
+            ScoredGlobalIndexResult scored = (ScoredGlobalIndexResult) globalIndexResult;
             dataOutput.writeInt(roaringNavigableMap64.getIntCardinality());
-            ScoreGetter scoreGetter = vectorSearchGlobalIndexResult.scoreGetter();
+            ScoreGetter scoreGetter = scored.scoreGetter();
             for (Long rowId : roaringNavigableMap64) {
                 dataOutput.writeFloat(scoreGetter.score(rowId));
             }
@@ -95,7 +95,7 @@ public class GlobalIndexResultSerializer implements Serializer<GlobalIndexResult
         int scoreSize = dataInput.readInt();
 
         if (scoreSize == 0) {
-            return GlobalIndexResult.create(() -> roaringNavigableMap64);
+            return GlobalIndexResult.create(roaringNavigableMap64);
         }
         checkArgument(
                 scoreSize == roaringNavigableMap64.getIntCardinality(),
@@ -115,6 +115,22 @@ public class GlobalIndexResultSerializer implements Serializer<GlobalIndexResult
             scoreMap.put(rowId, scores[i++]);
         }
 
-        return VectorSearchGlobalIndexResult.create(() -> roaringNavigableMap64, scoreMap::get);
+        return ScoredGlobalIndexResult.create(roaringNavigableMap64, scoreMap::get);
+    }
+
+    public byte[] serialize(GlobalIndexResult globalIndexResult) throws IOException {
+        DataOutputSerializer dataOutputSerializer = new DataOutputSerializer(1024);
+        serialize(globalIndexResult, dataOutputSerializer);
+        return dataOutputSerializer.getCopyOfBuffer();
+    }
+
+    public ScoredGlobalIndexResult deserialize(byte[] data) throws IOException {
+        DataInputDeserializer dataInputDeserializer = new DataInputDeserializer(data);
+        GlobalIndexResult globalIndexResult = deserialize(dataInputDeserializer);
+        Preconditions.checkArgument(
+                globalIndexResult instanceof ScoredGlobalIndexResult,
+                "Expected ScoredGlobalIndexResult, but got %s",
+                globalIndexResult == null ? "null" : globalIndexResult.getClass().getName());
+        return (ScoredGlobalIndexResult) globalIndexResult;
     }
 }

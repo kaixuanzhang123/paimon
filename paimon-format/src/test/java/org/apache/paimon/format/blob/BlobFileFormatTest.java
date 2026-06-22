@@ -20,8 +20,10 @@ package org.apache.paimon.format.blob;
 
 import org.apache.paimon.data.Blob;
 import org.apache.paimon.data.BlobData;
+import org.apache.paimon.data.BlobPlaceholder;
 import org.apache.paimon.data.BlobRef;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FormatReaderContext;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriter;
@@ -78,46 +80,108 @@ public class BlobFileFormatTest {
 
         // write
         FormatWriterFactory writerFactory = format.createWriterFactory(rowType);
-        List<byte[]> blobs = Arrays.asList("hello".getBytes(), "world".getBytes());
+        List<Object> blobs =
+                Arrays.asList(
+                        "hello".getBytes(),
+                        null,
+                        BlobPlaceholder.INSTANCE,
+                        "world".getBytes(),
+                        new byte[0]);
         try (PositionOutputStream out = fileIO.newOutputStream(file, false)) {
             FormatWriter formatWriter = writerFactory.create(out, null);
+            for (Object blob : blobs) {
+                if (blob == null) {
+                    formatWriter.addElement(GenericRow.of((Object) null));
+                } else if (blob == BlobPlaceholder.INSTANCE) {
+                    formatWriter.addElement(GenericRow.of(BlobPlaceholder.INSTANCE));
+                } else {
+                    formatWriter.addElement(GenericRow.of(new BlobData((byte[]) blob)));
+                }
+            }
+            formatWriter.close();
+        }
+
+        // read
+        FormatReaderFactory readerFactory = format.createReaderFactory(null, rowType, null);
+        FormatReaderContext context =
+                new FormatReaderContext(fileIO, file, fileIO.getFileSize(file));
+        List<Object> result = new ArrayList<>();
+        readerFactory
+                .createReader(context)
+                .forEachRemaining(
+                        row -> {
+                            if (row.isNullAt(0)) {
+                                result.add(null);
+                            } else {
+                                Blob blob = row.getBlob(0);
+                                if (blob == BlobPlaceholder.INSTANCE) {
+                                    result.add(BlobPlaceholder.INSTANCE);
+                                    return;
+                                } else if (blobAsDescriptor) {
+                                    assertThat(blob).isInstanceOf(BlobRef.class);
+                                } else {
+                                    assertThat(blob).isInstanceOf(BlobData.class);
+                                }
+                                result.add(blob.toData());
+                            }
+                        });
+
+        // assert
+        assertThat(result).hasSize(blobs.size());
+        assertThat((byte[]) result.get(0)).isEqualTo((byte[]) blobs.get(0));
+        assertThat(result.get(1)).isNull();
+        assertThat(result.get(2)).isSameAs(BlobPlaceholder.INSTANCE);
+        assertThat((byte[]) result.get(3)).isEqualTo((byte[]) blobs.get(3));
+        assertThat((byte[]) result.get(4)).isEqualTo((byte[]) blobs.get(4));
+
+        // read with selection
+        RoaringBitmap32 selection = new RoaringBitmap32();
+        selection.add(2);
+        context = new FormatReaderContext(fileIO, file, fileIO.getFileSize(file), selection);
+        result.clear();
+        readerFactory.createReader(context).forEachRemaining(row -> result.add(row.getBlob(0)));
+
+        // assert
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0)).isSameAs(BlobPlaceholder.INSTANCE);
+    }
+
+    @Test
+    public void testReadWithProjectedRowTypeContainingExtraFields() throws IOException {
+        BlobFileFormat format = new BlobFileFormat(false);
+        RowType writeRowType = RowType.of(DataTypes.BLOB());
+
+        // write blob data
+        List<byte[]> blobs = Arrays.asList("hello".getBytes(), "world".getBytes());
+        try (PositionOutputStream out = fileIO.newOutputStream(file, false)) {
+            FormatWriter formatWriter = format.createWriterFactory(writeRowType).create(out, null);
             for (byte[] bytes : blobs) {
                 formatWriter.addElement(GenericRow.of(new BlobData(bytes)));
             }
             formatWriter.close();
         }
 
-        // read
-        FormatReaderFactory readerFactory = format.createReaderFactory(null, null, null);
+        // read with a projectedRowType that has extra fields (simulating _ROW_ID scenario)
+        // projectedRowType: <BIGINT, BLOB> — blob is at index 1
+        RowType projectedRowType = RowType.of(DataTypes.BIGINT(), DataTypes.BLOB());
+        FormatReaderFactory readerFactory =
+                format.createReaderFactory(null, projectedRowType, null);
         FormatReaderContext context =
                 new FormatReaderContext(fileIO, file, fileIO.getFileSize(file));
-        List<byte[]> result = new ArrayList<>();
-        readerFactory
-                .createReader(context)
-                .forEachRemaining(
-                        row -> {
-                            Blob blob = row.getBlob(0);
-                            if (blobAsDescriptor) {
-                                assertThat(blob).isInstanceOf(BlobRef.class);
-                            } else {
-                                assertThat(blob).isInstanceOf(BlobData.class);
-                            }
-                            result.add(blob.toData());
-                        });
 
-        // assert
-        assertThat(result).containsExactlyElementsOf(blobs);
+        List<InternalRow> rows = new ArrayList<>();
+        readerFactory.createReader(context).forEachRemaining(rows::add);
 
-        // read with selection
-        RoaringBitmap32 selection = new RoaringBitmap32();
-        selection.add(1);
-        context = new FormatReaderContext(fileIO, file, fileIO.getFileSize(file), selection);
-        result.clear();
-        readerFactory
-                .createReader(context)
-                .forEachRemaining(row -> result.add(row.getBlob(0).toData()));
-
-        // assert
-        assertThat(result).containsOnly(blobs.get(1));
+        assertThat(rows).hasSize(2);
+        for (InternalRow row : rows) {
+            // row should have 2 fields
+            assertThat(row.getFieldCount()).isEqualTo(2);
+            // field 0 (BIGINT) should be null (default value)
+            assertThat(row.isNullAt(0)).isTrue();
+            // field 1 (BLOB) should contain data
+            assertThat(row.isNullAt(1)).isFalse();
+        }
+        assertThat(rows.get(0).getBlob(1).toData()).isEqualTo("hello".getBytes());
+        assertThat(rows.get(1).getBlob(1).toData()).isEqualTo("world".getBytes());
     }
 }

@@ -1,23 +1,24 @@
-"""
-Licensed to the Apache Software Foundation (ASF) under one
-or more contributor license agreements.  See the NOTICE file
-distributed with this work for additional information
-regarding copyright ownership.  The ASF licenses this file
-to you under the Apache License, Version 2.0 (the
-"License"); you may not use this file except in compliance
-with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional, Dict, Tuple
 
+from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.manifest.schema.data_file_meta import DataFileMeta
 from pypaimon.manifest.schema.manifest_entry import ManifestEntry
 from pypaimon.read.split import Split
@@ -45,6 +46,8 @@ class AbstractSplitGenerator(ABC):
         self.target_split_size = target_split_size
         self.open_file_cost = open_file_cost
         self.deletion_files_map = deletion_files_map or {}
+        self.default_part_value = table.options.options.get(
+            CoreOptions.PARTITION_DEFAULT_NAME, "__DEFAULT_PARTITION__")
         
         # Shard configuration
         self.idx_of_this_subtask = None
@@ -98,21 +101,15 @@ class AbstractSplitGenerator(ABC):
             else:
                 raw_convertible = True
 
-            file_paths = []
-            total_file_size = 0
-            total_record_count = 0
-
             for data_file in file_group:
                 data_file.set_file_path(
                     self.table.table_path,
                     file_entries[0].partition,
-                    file_entries[0].bucket
+                    file_entries[0].bucket,
+                    self.default_part_value
                 )
-                file_paths.append(data_file.file_path)
-                total_file_size += data_file.file_size
-                total_record_count += data_file.row_count
 
-            if file_paths:
+            if file_group:
                 # Get deletion files for this split
                 data_deletion_files = None
                 if self.deletion_files_map:
@@ -126,9 +123,6 @@ class AbstractSplitGenerator(ABC):
                     files=file_group,
                     partition=file_entries[0].partition,
                     bucket=file_entries[0].bucket,
-                    file_paths=file_paths,
-                    row_count=total_record_count,
-                    file_size=total_file_size,
                     raw_convertible=raw_convertible,
                     data_deletion_files=data_deletion_files
                 )
@@ -240,8 +234,3 @@ class AbstractSplitGenerator(ABC):
             return -1, -1
         # File is completely within the shard range
         return None
-
-    @staticmethod
-    def _is_blob_file(file_name: str) -> bool:
-        """Check if a file is a blob file."""
-        return file_name.endswith('.blob')

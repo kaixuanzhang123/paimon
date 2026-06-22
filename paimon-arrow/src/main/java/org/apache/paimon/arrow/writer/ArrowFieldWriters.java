@@ -25,6 +25,7 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.InternalVector;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.data.columnar.ArrayColumnVector;
 import org.apache.paimon.data.columnar.BooleanColumnVector;
@@ -40,6 +41,7 @@ import org.apache.paimon.data.columnar.MapColumnVector;
 import org.apache.paimon.data.columnar.RowColumnVector;
 import org.apache.paimon.data.columnar.ShortColumnVector;
 import org.apache.paimon.data.columnar.TimestampColumnVector;
+import org.apache.paimon.data.columnar.VecColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.data.variant.GenericVariant;
 import org.apache.paimon.data.variant.PaimonShreddingUtils;
@@ -65,6 +67,7 @@ import org.apache.arrow.vector.TimeStampVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
@@ -102,7 +105,7 @@ public class ArrowFieldWriters {
             for (int i = 0; i < batchRows; i++) {
                 int row = getRowNumber(startIndex, i, pickedInColumn);
                 if (columnVector.isNullAt(row)) {
-                    varCharVector.setNull(row);
+                    varCharVector.setNull(i);
                 } else {
                     byte[] value = ((BytesColumnVector) columnVector).getBytes(row).getBytes();
                     varCharVector.setSafe(i, value);
@@ -151,7 +154,7 @@ public class ArrowFieldWriters {
             for (int i = 0; i < batchRows; i++) {
                 int row = getRowNumber(startIndex, i, pickedInColumn);
                 if (columnVector.isNullAt(row)) {
-                    bitVector.setNull(row);
+                    bitVector.setNull(i);
                 } else {
                     int value = ((BooleanColumnVector) columnVector).getBoolean(row) ? 1 : 0;
                     bitVector.setSafe(i, value);
@@ -470,7 +473,7 @@ public class ArrowFieldWriters {
                 if (columnVector.isNullAt(row)) {
                     timeMilliVector.setNull(i);
                 } else {
-                    int value = ((IntColumnVector) columnVector).getInt(i);
+                    int value = ((IntColumnVector) columnVector).getInt(row);
                     timeMilliVector.setSafe(i, value);
                 }
             }
@@ -635,6 +638,8 @@ public class ArrowFieldWriters {
 
         private int offset;
 
+        private int[] reusableLengths;
+
         public ArrayWriter(
                 FieldVector fieldVector, ArrowFieldWriter elementWriter, boolean isNullable) {
             super(fieldVector, isNullable);
@@ -664,8 +669,12 @@ public class ArrowFieldWriters {
             }
 
             // length for arrays in [0, startIndex + batchRows)
-            // TODO: reuse this
-            int[] lengths = new int[lenSize];
+            int[] lengths;
+            if (reusableLengths == null || reusableLengths.length < lenSize) {
+                reusableLengths = new int[lenSize];
+            }
+            lengths = reusableLengths;
+            // Only use the first lenSize elements, reset if needed
             for (int i = 0; i < lenSize; i++) {
                 if (arrayColumnVector.isNullAt(i)) {
                     // null values don't occupy space
@@ -677,7 +686,7 @@ public class ArrowFieldWriters {
             }
 
             ArrayChildWriteInfo arrayChildWriteInfo =
-                    getArrayChildWriteInfo(pickedInColumn, startIndex, lengths);
+                    getArrayChildWriteInfo(pickedInColumn, startIndex, lengths, lenSize);
             elementWriter.write(
                     arrayColumnVector.getColumnVector(),
                     arrayChildWriteInfo.pickedInColumn,
@@ -711,6 +720,93 @@ public class ArrowFieldWriters {
         }
     }
 
+    /** Writer for VECTOR. */
+    public static class VectorWriter extends ArrowFieldWriter {
+
+        private final ArrowFieldWriter elementWriter;
+
+        private final int length;
+
+        public VectorWriter(
+                FieldVector fieldVector,
+                int length,
+                ArrowFieldWriter elementWriter,
+                boolean isNullable) {
+            super(fieldVector, isNullable);
+            this.length = length;
+            this.elementWriter = elementWriter;
+        }
+
+        @Override
+        public void reset() {
+            super.reset();
+            elementWriter.reset();
+        }
+
+        @Override
+        protected void doWrite(
+                ColumnVector columnVector,
+                @Nullable int[] pickedInColumn,
+                int startIndex,
+                int batchRows) {
+            VecColumnVector vecColumnVector = (VecColumnVector) columnVector;
+
+            if (pickedInColumn == null) {
+                elementWriter.write(
+                        vecColumnVector.getColumnVector(),
+                        null,
+                        startIndex * length,
+                        batchRows * length);
+            } else {
+                int[] childPickedInColumn = new int[batchRows * length];
+                for (int i = 0; i < batchRows; ++i) {
+                    int pickedIndexInChild = pickedInColumn[startIndex + i] * length;
+                    for (int j = 0; j < length; ++j) {
+                        childPickedInColumn[i * length + j] = pickedIndexInChild + j;
+                    }
+                }
+                elementWriter.write(
+                        vecColumnVector.getColumnVector(),
+                        childPickedInColumn,
+                        0,
+                        batchRows * length);
+            }
+
+            // set FixedSizeListVector
+            FixedSizeListVector listVector = (FixedSizeListVector) fieldVector;
+            for (int i = 0; i < batchRows; i++) {
+                int row = getRowNumber(startIndex, i, pickedInColumn);
+                if (vecColumnVector.isNullAt(row)) {
+                    listVector.setNull(i);
+                } else {
+                    listVector.startNewValue(i);
+                }
+            }
+        }
+
+        @Override
+        protected void doWrite(int rowIndex, DataGetters getters, int pos) {
+            InternalVector vector = getters.getVector(pos);
+            if (vector.size() != length) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "The size of vector %s is not equal to the length %s",
+                                vector.size(), length));
+            }
+            FixedSizeListVector listVector = (FixedSizeListVector) fieldVector;
+            listVector.setNotNull(rowIndex);
+            final int rowBase = rowIndex * length;
+            for (int vectorIndex = 0; vectorIndex < length; ++vectorIndex) {
+                elementWriter.write(rowBase + vectorIndex, vector, vectorIndex);
+            }
+            // Ensure child value count is large enough.
+            listVector
+                    .getDataVector()
+                    .setValueCount(
+                            Math.max(listVector.getDataVector().getValueCount(), rowBase + length));
+        }
+    }
+
     /** Writer for MAP. */
     public static class MapWriter extends ArrowFieldWriter {
 
@@ -718,6 +814,8 @@ public class ArrowFieldWriters {
         private final ArrowFieldWriter valueWriter;
 
         private int offset;
+
+        private int[] reusableLengths;
 
         public MapWriter(
                 FieldVector fieldVector,
@@ -753,8 +851,10 @@ public class ArrowFieldWriters {
             }
 
             // length for arrays in [0, startIndex + batchRows)
-            // TODO: reuse this
-            int[] lengths = new int[lenSize];
+            if (reusableLengths == null || reusableLengths.length < lenSize) {
+                reusableLengths = new int[lenSize];
+            }
+            int[] lengths = reusableLengths;
             for (int i = 0; i < lenSize; i++) {
                 if (mapColumnVector.isNullAt(i)) {
                     // null values don't occupy space
@@ -766,7 +866,7 @@ public class ArrowFieldWriters {
             }
 
             ArrayChildWriteInfo arrayChildWriteInfo =
-                    getArrayChildWriteInfo(pickedInColumn, startIndex, lengths);
+                    getArrayChildWriteInfo(pickedInColumn, startIndex, lengths, lenSize);
             keyWriter.write(
                     mapColumnVector.getChildren()[0],
                     arrayChildWriteInfo.pickedInColumn,
@@ -830,20 +930,23 @@ public class ArrowFieldWriters {
     }
 
     private static ArrayChildWriteInfo getArrayChildWriteInfo(
-            @Nullable int[] pickedInParentColumn, int parentStartIndex, int[] parentLengths) {
+            @Nullable int[] pickedInParentColumn,
+            int parentStartIndex,
+            int[] parentLengths,
+            int lenSize) {
         return pickedInParentColumn == null
-                ? getArrayChildWriteInfoWithoutDelete(parentStartIndex, parentLengths)
+                ? getArrayChildWriteInfoWithoutDelete(parentStartIndex, parentLengths, lenSize)
                 : getArrayChildWriteInfoWithDelete(
-                        pickedInParentColumn, parentStartIndex, parentLengths);
+                        pickedInParentColumn, parentStartIndex, parentLengths, lenSize);
     }
 
     private static ArrayChildWriteInfo getArrayChildWriteInfoWithoutDelete(
-            int parentStartIndex, int[] parentLengths) {
+            int parentStartIndex, int[] parentLengths, int lenSize) {
         // the first element index which is to be written
         int firstElementIndex = 0;
         // batchRows of child column vector
         int childBatchRows = 0;
-        for (int i = 0; i < parentLengths.length; i++) {
+        for (int i = 0; i < lenSize; i++) {
             if (i < parentStartIndex) {
                 firstElementIndex += parentLengths[i];
             } else {
@@ -854,14 +957,14 @@ public class ArrowFieldWriters {
     }
 
     private static ArrayChildWriteInfo getArrayChildWriteInfoWithDelete(
-            int[] pickedInParentColumn, int parentStartIndex, int[] parentLengths) {
+            int[] pickedInParentColumn, int parentStartIndex, int[] parentLengths, int lenSize) {
         // the first element index which is to be written
         int firstElementIndex = 0;
         // objects to calculate child pickedInColumn
         IntArrayList childPicked = new IntArrayList(1024);
         int offset = 0;
         int currentParentPickedIndex = parentStartIndex;
-        for (int i = 0; i < parentLengths.length; i++) {
+        for (int i = 0; i < lenSize; i++) {
             if (i < pickedInParentColumn[parentStartIndex]) {
                 firstElementIndex += parentLengths[i];
                 offset = firstElementIndex;

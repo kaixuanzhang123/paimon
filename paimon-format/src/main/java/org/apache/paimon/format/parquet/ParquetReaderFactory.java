@@ -18,6 +18,7 @@
 
 package org.apache.paimon.format.parquet;
 
+import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.data.columnar.writable.WritableColumnVector;
@@ -34,6 +35,7 @@ import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VectorType;
 import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.Preconditions;
 
@@ -57,7 +59,10 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.apache.paimon.data.variant.VariantMetadataUtils.path;
 import static org.apache.paimon.format.parquet.ParquetSchemaConverter.PAIMON_SCHEMA;
@@ -79,12 +84,30 @@ public class ParquetReaderFactory implements FormatReaderFactory {
     private final int batchSize;
     @Nullable private final FilterCompat.Filter filter;
 
+    /**
+     * Cache: fileSchema -> requestedSchema.
+     *
+     * <p>Within one factory instance the readType is fixed, so the result of {@code
+     * clipParquetSchema(fileSchema)} is deterministic for a given {@code fileSchema}. Most
+     * Paimon-written files sharing the same schema version will have identical file schemas, so the
+     * cache will almost always have at most one entry. Keying by the actual {@code fileSchema}
+     * (rather than assuming all files have the same schema) keeps correctness for edge cases such
+     * as externally-migrated Parquet files whose on-disk schema may vary.
+     */
+    private final Map<MessageType, RequestedSchema> requestedSchemaCache =
+            new ConcurrentHashMap<>();
+
     public ParquetReaderFactory(
             Options conf, RowType readType, int batchSize, @Nullable FilterCompat.Filter filter) {
         this.conf = conf;
         this.readFields = readType.getFields().toArray(new DataField[0]);
         this.batchSize = batchSize;
         this.filter = filter;
+    }
+
+    @VisibleForTesting
+    Map<MessageType, RequestedSchema> requestedSchemaCache() {
+        return requestedSchemaCache;
     }
 
     @Override
@@ -102,24 +125,49 @@ public class ParquetReaderFactory implements FormatReaderFactory {
                         builder.build(),
                         context.selection());
         MessageType fileSchema = reader.getFileMetaData().getSchema();
-        MessageType requestedSchema = clipParquetSchema(fileSchema);
+        RequestedSchema requestedSchema = getOrCreateRequestedSchema(fileSchema);
 
         if (LOG.isDebugEnabled()) {
             LOG.debug(
                     "Create reader of the parquet file {}, the fileSchema is {}, the requestedSchema is {}.",
                     context.filePath(),
                     fileSchema,
-                    requestedSchema);
+                    requestedSchema.messageType);
         }
 
-        reader.setRequestedSchema(requestedSchema);
-        WritableColumnVector[] writableVectors = createWritableVectors();
-
-        MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(requestedSchema);
-        List<ParquetField> fields = buildFieldsList(readFields, columnIO, requestedSchema);
+        int actualBatchSize = computeBatchSize(reader, requestedSchema.messageType);
+        Preconditions.checkArgument(
+                actualBatchSize > 0,
+                "Parquet read batch size should be positive: %s",
+                actualBatchSize);
+        reader.setRequestedSchema(requestedSchema.messageType);
+        WritableColumnVector[] writableVectors = createWritableVectors(actualBatchSize);
 
         return new VectorizedParquetRecordReader(
-                context.filePath(), reader, fileSchema, fields, writableVectors, batchSize);
+                context.filePath(),
+                reader,
+                fileSchema,
+                requestedSchema.fields,
+                writableVectors,
+                actualBatchSize,
+                context.fileIO());
+    }
+
+    private RequestedSchema getOrCreateRequestedSchema(MessageType fileSchema) {
+        // clipParquetSchema and buildFieldsList are pure functions of (readFields, fileSchema).
+        // Cache the result keyed by fileSchema so that files sharing the same on-disk schema
+        // within this factory instance avoid redundant computation. Keying by fileSchema (rather
+        // than a simple "compute once" flag) correctly handles edge cases where different files
+        // read by the same factory instance may have different on-disk schemas, e.g. externally
+        // migrated Parquet files.
+        return requestedSchemaCache.computeIfAbsent(fileSchema, this::createRequestedSchema);
+    }
+
+    private RequestedSchema createRequestedSchema(MessageType fileSchema) {
+        MessageType rs = clipParquetSchema(fileSchema);
+        MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(rs);
+        List<ParquetField> f = buildFieldsList(readFields, columnIO, rs);
+        return new RequestedSchema(rs, f);
     }
 
     /** Clips `parquetSchema` according to `fieldNames`. */
@@ -178,7 +226,11 @@ public class ParquetReaderFactory implements FormatReaderFactory {
                         clipParquetType(mapType.getKeyType(), keyValueType.getLeft()),
                         clipParquetType(mapType.getValueType(), keyValueType.getRight()));
             case ARRAY:
-                ArrayType arrayType = (ArrayType) readType;
+            case VECTOR:
+                DataType elementReadType =
+                        readType instanceof ArrayType
+                                ? ((ArrayType) readType).getElementType()
+                                : ((VectorType) readType).getElementType();
                 GroupType arrayGroup = (GroupType) parquetType;
                 int listSubFields = arrayGroup.getFieldCount();
                 Preconditions.checkArgument(
@@ -189,8 +241,7 @@ public class ParquetReaderFactory implements FormatReaderFactory {
                 // https://impala.apache.org/docs/build/html/topics/impala_parquet_array_resolution.html.
                 int level = arrayGroup.getType(0) instanceof GroupType ? 3 : 2;
                 Type elementType =
-                        clipParquetType(
-                                arrayType.getElementType(), parquetListElementType(arrayGroup));
+                        clipParquetType(elementReadType, parquetListElementType(arrayGroup));
 
                 if (level == 3) {
                     // In case that the name in middle level is not "list".
@@ -268,11 +319,46 @@ public class ParquetReaderFactory implements FormatReaderFactory {
         return parquetType.withNewFields(rowGroupFields);
     }
 
-    private WritableColumnVector[] createWritableVectors() {
+    /**
+     * Compute the batch size to use for the given file. Subclasses can override this to implement
+     * dynamic per-file batch sizing based on footer metadata. The default implementation returns
+     * the static {@code batchSize} passed to the constructor.
+     */
+    protected int computeBatchSize(ParquetFileReader reader, MessageType requestedSchema) {
+        return batchSize;
+    }
+
+    private WritableColumnVector[] createWritableVectors(int batchSize) {
         WritableColumnVector[] columns = new WritableColumnVector[readFields.length];
         for (int i = 0; i < readFields.length; i++) {
             columns[i] = createWritableColumnVector(batchSize, readFields[i].type());
         }
         return columns;
+    }
+
+    private static class RequestedSchema {
+
+        private final MessageType messageType;
+        private final List<ParquetField> fields;
+
+        private RequestedSchema(MessageType messageType, List<ParquetField> fields) {
+            this.messageType = messageType;
+            this.fields = fields;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            RequestedSchema that = (RequestedSchema) o;
+            return Objects.equals(messageType, that.messageType)
+                    && Objects.equals(fields, that.fields);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(messageType, fields);
+        }
     }
 }

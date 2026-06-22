@@ -1,0 +1,331 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.globalindex.testfulltext;
+
+import org.apache.paimon.fs.SeekableInputStream;
+import org.apache.paimon.globalindex.GlobalIndexIOMeta;
+import org.apache.paimon.globalindex.GlobalIndexReader;
+import org.apache.paimon.globalindex.GlobalIndexResult;
+import org.apache.paimon.globalindex.ScoredGlobalIndexResult;
+import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
+import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.FullTextQuery;
+import org.apache.paimon.predicate.FullTextSearch;
+import org.apache.paimon.utils.RoaringNavigableMap64;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Test full-text index reader that performs brute-force text matching. Loads all documents into
+ * memory and scores them against the query using simple term-frequency matching.
+ *
+ * <p>Scoring: for each query term found in the document (case-insensitive), score += 1.0 /
+ * queryTermCount. A document that contains all query terms scores 1.0.
+ */
+public class TestFullTextGlobalIndexReader implements GlobalIndexReader {
+
+    private final GlobalIndexFileReader fileReader;
+    private final GlobalIndexIOMeta ioMeta;
+
+    private String[] documents;
+    private long[] rowIds;
+    private int count;
+
+    public TestFullTextGlobalIndexReader(
+            GlobalIndexFileReader fileReader, GlobalIndexIOMeta ioMeta) {
+        this.fileReader = fileReader;
+        this.ioMeta = ioMeta;
+    }
+
+    @Override
+    public CompletableFuture<Optional<ScoredGlobalIndexResult>> visitFullTextSearch(
+            FullTextSearch fullTextSearch) {
+        try {
+            ensureLoaded();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load test full-text index", e);
+        }
+
+        int limit = fullTextSearch.limit();
+        int effectiveK = Math.min(limit, count);
+        if (effectiveK <= 0) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+
+        // Min-heap: smallest score at head, so we evict the weakest candidate.
+        PriorityQueue<ScoredRow> topK =
+                new PriorityQueue<>(effectiveK + 1, Comparator.comparingDouble(s -> s.score));
+
+        for (int i = 0; i < count; i++) {
+            float score = computeScore(documents[i], fullTextSearch.query());
+            if (score <= 0) {
+                continue;
+            }
+            if (topK.size() < effectiveK) {
+                topK.offer(new ScoredRow(rowIds[i], score));
+            } else if (score > topK.peek().score) {
+                topK.poll();
+                topK.offer(new ScoredRow(rowIds[i], score));
+            }
+        }
+
+        if (topK.isEmpty()) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+
+        RoaringNavigableMap64 resultBitmap = new RoaringNavigableMap64();
+        Map<Long, Float> scoreMap = new HashMap<>(topK.size());
+        for (ScoredRow row : topK) {
+            resultBitmap.add(row.rowId);
+            scoreMap.put(row.rowId, row.score);
+        }
+
+        return CompletableFuture.completedFuture(
+                Optional.of(ScoredGlobalIndexResult.create(resultBitmap, scoreMap::get)));
+    }
+
+    private static float computeScore(String document, FullTextQuery query) {
+        if (query instanceof FullTextQuery.Match) {
+            FullTextQuery.Match match = (FullTextQuery.Match) query;
+            return computeMatchScore(
+                            document, match.terms(), match.operator() == FullTextQuery.Operator.AND)
+                    * match.boost();
+        }
+        if (query instanceof FullTextQuery.Phrase) {
+            FullTextQuery.Phrase phrase = (FullTextQuery.Phrase) query;
+            return document.toLowerCase(Locale.ROOT)
+                            .contains(phrase.terms().toLowerCase(Locale.ROOT))
+                    ? 1.0f
+                    : 0.0f;
+        }
+        if (query instanceof FullTextQuery.Boost) {
+            FullTextQuery.Boost boost = (FullTextQuery.Boost) query;
+            float score = computeScore(document, boost.positive());
+            if (computeScore(document, boost.negative()) > 0) {
+                score *= boost.negativeBoost();
+            }
+            return score;
+        }
+        if (query instanceof FullTextQuery.MultiMatch) {
+            throw new IllegalArgumentException(
+                    "multi_match is not supported by single-column full-text indexes");
+        }
+        if (query instanceof FullTextQuery.BooleanQuery) {
+            return computeBooleanScore(document, (FullTextQuery.BooleanQuery) query);
+        }
+        throw new IllegalArgumentException("Unsupported full-text query: " + query);
+    }
+
+    private static float computeMatchScore(
+            String document, String queryText, boolean requireAllTerms) {
+        String[] queryTerms = queryText.toLowerCase(Locale.ROOT).split("\\s+");
+        String lowerDoc = document.toLowerCase(Locale.ROOT);
+        float score = 0;
+        for (String term : queryTerms) {
+            if (lowerDoc.contains(term)) {
+                score += 1.0f / queryTerms.length;
+            } else if (requireAllTerms) {
+                return 0;
+            }
+        }
+        return score;
+    }
+
+    private static float computeBooleanScore(String document, FullTextQuery.BooleanQuery query) {
+        float score = 0;
+        for (FullTextQuery child : query.must()) {
+            float childScore = computeScore(document, child);
+            if (childScore <= 0) {
+                return 0;
+            }
+            score += childScore;
+        }
+        for (FullTextQuery child : query.mustNot()) {
+            if (computeScore(document, child) > 0) {
+                return 0;
+            }
+        }
+        float shouldScore = 0;
+        for (FullTextQuery child : query.should()) {
+            shouldScore += computeScore(document, child);
+        }
+        if (query.must().isEmpty() && !query.should().isEmpty() && shouldScore <= 0) {
+            return 0;
+        }
+        return score + shouldScore;
+    }
+
+    private void ensureLoaded() throws IOException {
+        if (documents != null) {
+            return;
+        }
+
+        try (SeekableInputStream in = fileReader.getInputStream(ioMeta)) {
+            // Read header: count (4 bytes)
+            byte[] headerBytes = new byte[4];
+            readFully(in, headerBytes);
+            ByteBuffer header = ByteBuffer.wrap(headerBytes);
+            header.order(ByteOrder.LITTLE_ENDIAN);
+            count = header.getInt();
+
+            // Read documents
+            documents = new String[count];
+            rowIds = new long[count];
+            for (int i = 0; i < count; i++) {
+                byte[] entryHeaderBytes = new byte[Long.BYTES + Integer.BYTES];
+                readFully(in, entryHeaderBytes);
+                ByteBuffer entryHeader = ByteBuffer.wrap(entryHeaderBytes);
+                entryHeader.order(ByteOrder.LITTLE_ENDIAN);
+                rowIds[i] = entryHeader.getLong();
+                int textLen = entryHeader.getInt();
+
+                byte[] textBytes = new byte[textLen];
+                readFully(in, textBytes);
+                documents[i] = new String(textBytes, StandardCharsets.UTF_8);
+            }
+        }
+    }
+
+    private static void readFully(SeekableInputStream in, byte[] buf) throws IOException {
+        int offset = 0;
+        while (offset < buf.length) {
+            int bytesRead = in.read(buf, offset, buf.length - offset);
+            if (bytesRead < 0) {
+                throw new IOException(
+                        "Unexpected end of stream: read "
+                                + offset
+                                + " bytes but expected "
+                                + buf.length);
+            }
+            offset += bytesRead;
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        documents = null;
+        rowIds = null;
+    }
+
+    // =================== unsupported predicate operations =====================
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitIsNotNull(FieldRef fieldRef) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitIsNull(FieldRef fieldRef) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitStartsWith(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitEndsWith(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitContains(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitLike(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitLessThan(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitGreaterOrEqual(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitNotEqual(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitLessOrEqual(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitEqual(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitGreaterThan(
+            FieldRef fieldRef, Object literal) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitIn(
+            FieldRef fieldRef, List<Object> literals) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    @Override
+    public CompletableFuture<Optional<GlobalIndexResult>> visitNotIn(
+            FieldRef fieldRef, List<Object> literals) {
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    /** A row ID paired with its similarity score, used in the top-k min-heap. */
+    private static class ScoredRow {
+        final long rowId;
+        final float score;
+
+        ScoredRow(long rowId, float score) {
+            this.rowId = rowId;
+            this.score = score;
+        }
+    }
+}

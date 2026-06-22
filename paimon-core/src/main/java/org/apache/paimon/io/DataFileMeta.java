@@ -41,7 +41,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.apache.paimon.data.BinaryRow.EMPTY_ROW;
 import static org.apache.paimon.stats.SimpleStats.EMPTY_STATS;
@@ -275,8 +277,15 @@ public interface DataFileMeta {
 
     SimpleStats valueStats();
 
+    /**
+     * Minimum sequence number of records in this file. When {@code sequence.snapshot-ordering} is
+     * enabled for a primary-key table, this field is repurposed to carry the commit snapshot id
+     * instead of the per-record sequence number range (the snapshot id is stamped into it at commit
+     * time by {@code FileStoreCommitImpl}).
+     */
     long minSequenceNumber();
 
+    /** @see #minSequenceNumber() */
     long maxSequenceNumber();
 
     long schemaId();
@@ -309,6 +318,11 @@ public interface DataFileMeta {
         return firstRowId;
     }
 
+    default Range nonNullRowIdRange() {
+        long firstRowId = nonNullFirstRowId();
+        return new Range(firstRowId, firstRowId + rowCount() - 1);
+    }
+
     @Nullable
     List<String> writeCols();
 
@@ -321,6 +335,8 @@ public interface DataFileMeta {
     DataFileMeta assignSequenceNumber(long minSequenceNumber, long maxSequenceNumber);
 
     DataFileMeta assignFirstRowId(long firstRowId);
+
+    DataFileMeta newFirstRowId(@Nullable Long newFirstRowId);
 
     default List<Path> collectFiles(DataFilePathFactory pathFactory) {
         List<Path> paths = new ArrayList<>();
@@ -342,5 +358,10 @@ public interface DataFileMeta {
                 .map(DataFileMeta::maxSequenceNumber)
                 .max(Long::compare)
                 .orElse(-1L);
+    }
+
+    static Map<Integer, List<DataFileMeta>> groupByLevel(List<DataFileMeta> files) {
+        return files.stream()
+                .collect(Collectors.groupingBy(DataFileMeta::level, Collectors.toList()));
     }
 }

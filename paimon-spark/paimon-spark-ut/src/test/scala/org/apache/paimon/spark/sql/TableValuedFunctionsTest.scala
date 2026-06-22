@@ -21,6 +21,7 @@ package org.apache.paimon.spark.sql
 import org.apache.paimon.data.{BinaryString, GenericRow, Timestamp}
 import org.apache.paimon.manifest.ManifestCommittable
 import org.apache.paimon.spark.PaimonHiveTestBase
+import org.apache.paimon.spark.catalyst.plans.logical.PaimonTableValuedFunctions
 import org.apache.paimon.utils.DateTimeUtils
 
 import org.apache.spark.sql.{DataFrame, Row}
@@ -29,6 +30,16 @@ import java.time.LocalDateTime
 import java.util.Collections
 
 class TableValuedFunctionsTest extends PaimonHiveTestBase {
+
+  test("parse positive limit rejects overflowing long") {
+    val longValue: Long = 4294967297L
+    assert(longValue.toInt > 0)
+
+    val error = intercept[IllegalArgumentException] {
+      PaimonTableValuedFunctions.parsePositiveLimit(longValue)
+    }
+    assert(error.getMessage.contains("Limit must be no greater than"))
+  }
 
   withPk.foreach {
     hasPk =>
@@ -341,6 +352,27 @@ class TableValuedFunctionsTest extends PaimonHiveTestBase {
       checkAnswer(
         sql("SELECT * FROM paimon_incremental_query('`t$audit_log`', 'tag1', 'tag2') ORDER BY id"),
         Seq())
+    }
+  }
+
+  test("incremental query by tag with LIMIT") {
+    sql("use paimon")
+    withTable("t") {
+      spark.sql("""
+                  |CREATE TABLE t (a INT, b INT, c STRING)
+                  |USING paimon
+                  |TBLPROPERTIES ('primary-key'='a,b', 'bucket' = '2')
+                  |PARTITIONED BY (a)
+                  |""".stripMargin)
+      spark.sql("INSERT INTO t VALUES (1, 1, '1'), (2, 2, '2')")
+      sql("CALL sys.create_tag('t', 'tag1')")
+      spark.sql("INSERT INTO t VALUES (1, 3, '3'), (2, 4, '4')")
+      sql("CALL sys.create_tag('t', 'tag2')")
+
+      checkAnswer(
+        spark.sql(
+          "SELECT * FROM paimon_incremental_query('t', 'tag1', 'tag2') ORDER BY a, b LIMIT 5"),
+        Seq(Row(1, 3, "3"), Row(2, 4, "4")))
     }
   }
 

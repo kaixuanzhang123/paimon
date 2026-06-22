@@ -35,6 +35,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.apache.paimon.io.DataFilePathFactory.dataFileToFileIndexPath;
 
@@ -45,12 +46,12 @@ import static org.apache.paimon.io.DataFilePathFactory.dataFileToFileIndexPath;
 public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalRow, DataFileMeta> {
 
     private final long schemaId;
-    private final LongCounter seqNumCounter;
     private final boolean isExternalPath;
     private final SimpleStatsConverter statsArraySerializer;
     @Nullable private final DataFileIndexWriter dataFileIndexWriter;
     private final FileSource fileSource;
     @Nullable private final List<String> writeCols;
+    private final RowDataFileSequenceNumberTracker sequenceNumberTracker;
 
     public RowDataFileWriter(
             FileIO fileIO,
@@ -58,7 +59,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
             Path path,
             RowType writeSchema,
             long schemaId,
-            LongCounter seqNumCounter,
+            Supplier<LongCounter> seqNumCounterSupplier,
             FileIndexOptions fileIndexOptions,
             FileSource fileSource,
             boolean asyncFileWrite,
@@ -67,7 +68,6 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
             @Nullable List<String> writeCols) {
         super(fileIO, context, path, Function.identity(), writeSchema, asyncFileWrite);
         this.schemaId = schemaId;
-        this.seqNumCounter = seqNumCounter;
         this.isExternalPath = isExternalPath;
         this.statsArraySerializer = new SimpleStatsConverter(writeSchema, statsDenseStore);
         this.dataFileIndexWriter =
@@ -75,6 +75,9 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
                         fileIO, dataFileToFileIndexPath(path), writeSchema, fileIndexOptions);
         this.fileSource = fileSource;
         this.writeCols = writeCols;
+        this.sequenceNumberTracker =
+                new RowDataFileSequenceNumberTracker(
+                        writeSchema, seqNumCounterSupplier, super::recordCount);
     }
 
     @Override
@@ -84,7 +87,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
         if (dataFileIndexWriter != null) {
             dataFileIndexWriter.write(row);
         }
-        seqNumCounter.add(1L);
+        sequenceNumberTracker.update(row);
     }
 
     @Override
@@ -110,8 +113,8 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
                 fileSize,
                 recordCount(),
                 statsPair.getRight(),
-                seqNumCounter.getValue() - super.recordCount(),
-                seqNumCounter.getValue() - 1,
+                sequenceNumberTracker.min(),
+                sequenceNumberTracker.max(),
                 schemaId,
                 indexResult.independentIndexFile() == null
                         ? Collections.emptyList()

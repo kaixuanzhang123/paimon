@@ -23,7 +23,6 @@ import org.apache.paimon.FileStore;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.globalindex.GlobalIndexScanBuilder;
 import org.apache.paimon.index.IndexFileHandler;
 import org.apache.paimon.manifest.IndexManifestFile;
 import org.apache.paimon.manifest.ManifestFile;
@@ -220,9 +219,13 @@ public class PrivilegedFileStore<T> implements FileStore<T> {
     }
 
     @Override
-    public boolean mergeSchema(RowType rowType, boolean allowExplicitCast) {
+    public boolean mergeSchema(
+            RowType rowType,
+            boolean typeWidening,
+            boolean allowExplicitCast,
+            boolean caseSensitive) {
         privilegeChecker.assertCanInsert(identifier);
-        return wrapped.mergeSchema(rowType, allowExplicitCast);
+        return wrapped.mergeSchema(rowType, typeWidening, allowExplicitCast, caseSensitive);
     }
 
     @Override
@@ -238,10 +241,5 @@ public class PrivilegedFileStore<T> implements FileStore<T> {
     @Override
     public void setSnapshotCache(Cache<Path, Snapshot> cache) {
         wrapped.setSnapshotCache(cache);
-    }
-
-    @Override
-    public GlobalIndexScanBuilder newGlobalIndexScanBuilder() {
-        return wrapped.newGlobalIndexScanBuilder();
     }
 }

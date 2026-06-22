@@ -1,36 +1,45 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import collections
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.dataset as ds
 from pyarrow import RecordBatch
 
+from pypaimon.manifest.schema.data_file_meta import DataFileMeta
+from pypaimon.read.reader.format_blob_reader import BlobRecordIterator
 from pypaimon.read.reader.iface.record_batch_reader import RecordBatchReader
+from pypaimon.table.row.blob import Blob
+from pypaimon.utils.range import Range
+
+_MIN_BATCH_SIZE_TO_REFILL = 1024
 
 
 class ConcatBatchReader(RecordBatchReader):
 
-    def __init__(self, reader_suppliers: List[Callable]):
+    def __init__(self, reader_suppliers: List[Callable], file_io=None,
+                 blob_field_indices=None, vector_field_indices=None):
         self.queue: collections.deque[Callable] = collections.deque(reader_suppliers)
         self.current_reader: Optional[RecordBatchReader] = None
+        self.file_io = file_io
+        self.blob_field_indices = blob_field_indices
+        self.vector_field_indices = vector_field_indices
 
     def read_arrow_batch(self) -> Optional[RecordBatch]:
         while True:
@@ -113,7 +122,7 @@ class MergeAllBatchReader(RecordBatchReader):
                         combined_arrays.append(pa.concat_arrays(column_arrays))
                     self.merged_batch = pa.RecordBatch.from_arrays(
                         combined_arrays,
-                        names=all_concatenated_batches[0].schema.names
+                        schema=all_concatenated_batches[0].schema
                     )
         else:
             self.merged_batch = None
@@ -141,7 +150,13 @@ class DataEvolutionMergeReader(RecordBatchReader):
      - The sixth field comes from batch1, and it is at offset 0 in batch1.
     """
 
-    def __init__(self, row_offsets: List[int], field_offsets: List[int], readers: List[Optional[RecordBatchReader]]):
+    def __init__(
+        self,
+        row_offsets: List[int],
+        field_offsets: List[int],
+        readers: List[Optional[RecordBatchReader]],
+        schema: pa.Schema,
+    ):
         if row_offsets is None:
             raise ValueError("Row offsets must not be null")
         if field_offsets is None:
@@ -155,34 +170,190 @@ class DataEvolutionMergeReader(RecordBatchReader):
         self.row_offsets = row_offsets
         self.field_offsets = field_offsets
         self.readers = readers
+        self.schema = schema
+        self._buffers: List[Optional[RecordBatch]] = [None] * len(readers)
 
     def read_arrow_batch(self) -> Optional[RecordBatch]:
         batches: List[Optional[RecordBatch]] = [None] * len(self.readers)
         for i, reader in enumerate(self.readers):
             if reader is not None:
-                batch = reader.read_arrow_batch()
-                if batch is None:
-                    # all readers are aligned, as long as one returns null, the others will also have no data
-                    return None
-                batches[i] = batch
-        # Assemble record batches from batches based on row_offsets and field_offsets
+                if self._buffers[i] is not None:
+                    remainder = self._buffers[i]
+                    self._buffers[i] = None
+                    if remainder.num_rows >= _MIN_BATCH_SIZE_TO_REFILL:
+                        batches[i] = remainder
+                    else:
+                        new_batch = reader.read_arrow_batch()
+                        if new_batch is not None and new_batch.num_rows > 0:
+                            combined_arrays = [
+                                pa.concat_arrays([remainder.column(j), new_batch.column(j)])
+                                for j in range(remainder.num_columns)
+                            ]
+                            batches[i] = pa.RecordBatch.from_arrays(
+                                combined_arrays, schema=remainder.schema
+                            )
+                        else:
+                            batches[i] = remainder
+                else:
+                    batch = reader.read_arrow_batch()
+                    if batch is None:
+                        batches[i] = None
+                    else:
+                        batches[i] = batch
+            else:
+                batches[i] = None
+
+        if not any(b is not None for b in batches):
+            return None
+
+        min_rows = min(b.num_rows for b in batches if b is not None)
+        if min_rows == 0:
+            return None
+
         columns = []
-        names = []
         for i in range(len(self.row_offsets)):
             batch_index = self.row_offsets[i]
             field_index = self.field_offsets[i]
-            if batches[batch_index] is not None:
-                column = batches[batch_index].column(field_index)
-                columns.append(column)
-                names.append(batches[batch_index].schema.names[field_index])
-        if columns:
-            return pa.RecordBatch.from_arrays(columns, names)
-        return None
+            if batch_index >= 0 and batches[batch_index] is not None:
+                columns.append(batches[batch_index].column(field_index).slice(0, min_rows))
+            else:
+                columns.append(pa.nulls(min_rows, type=self.schema.field(i).type))
+
+        for i in range(len(self.readers)):
+            if batches[i] is not None and batches[i].num_rows > min_rows:
+                self._buffers[i] = batches[i].slice(min_rows, batches[i].num_rows - min_rows)
+
+        return pa.RecordBatch.from_arrays(columns, schema=self.schema)
 
     def close(self) -> None:
         try:
+            self._buffers = [None] * len(self.readers)
             for reader in self.readers:
                 if reader is not None:
                     reader.close()
         except Exception as e:
             raise IOError("Failed to close inner readers") from e
+
+
+class BlobFallbackBatchReader(RecordBatchReader):
+    """Resolve blob placeholders by falling back through older blob versions."""
+
+    def __init__(self, file_reader_suppliers: List[Tuple[DataFileMeta, Callable]],
+                 field_name: str, output_type, row_ranges: Optional[List[Range]] = None,
+                 blob_as_descriptor: bool = False):
+        self._file_reader_suppliers = file_reader_suppliers
+        self._field_name = field_name
+        self._output_type = output_type
+        self._row_ranges = Range.sort_and_merge_overlap(row_ranges) if row_ranges else None
+        self._blob_as_descriptor = blob_as_descriptor
+        self._returned = False
+        self._readers: List[RecordBatchReader] = []
+
+    def read_arrow_batch(self) -> Optional[RecordBatch]:
+        if self._returned:
+            return None
+        self._returned = True
+
+        groups: Dict[int, Dict[int, Tuple[object, bool]]] = {}
+        target_row_ids = self._target_row_ids()
+
+        for file, supplier in self._file_reader_suppliers:
+            row_ids = self._selected_row_ids(file)
+            blob_values = self._read_blob_values(file, supplier)
+            if len(blob_values) != len(row_ids):
+                raise ValueError(
+                    "Blob fallback reader returned an unexpected row count "
+                    f"for {file.file_name}: expect {len(row_ids)}, got {len(blob_values)}."
+                )
+            if not row_ids:
+                continue
+            group = groups.setdefault(file.max_sequence_number, {})
+            for row_id, blob in zip(row_ids, blob_values):
+                if row_id in group:
+                    raise ValueError(
+                        "Blob files within the same max sequence should not overlap."
+                    )
+                if blob is None:
+                    group[row_id] = (None, False)
+                elif blob is Blob.PLACE_HOLDER:
+                    group[row_id] = (None, True)
+                else:
+                    if self._blob_as_descriptor:
+                        group[row_id] = (blob.to_descriptor().serialize(), False)
+                    else:
+                        group[row_id] = (blob.to_data(), False)
+
+        if not groups:
+            return None
+
+        result = []
+        for row_id in target_row_ids:
+            found = False
+            for max_sequence_number in sorted(groups.keys(), reverse=True):
+                candidate = groups[max_sequence_number].get(row_id)
+                if candidate is None:
+                    continue
+                value, is_placeholder = candidate
+                if not is_placeholder:
+                    result.append(value)
+                    found = True
+                    break
+            if not found:
+                raise ValueError("All blob files at the same row id store a placeholder.")
+
+        return pa.RecordBatch.from_arrays(
+            [pa.array(result, type=self._output_type)],
+            names=[self._field_name],
+        )
+
+    def _target_row_ids(self) -> List[int]:
+        file_ranges = [
+            file.row_id_range()
+            for file, _ in self._file_reader_suppliers
+        ]
+        ranges = [
+            Range(
+                min(row_range.from_ for row_range in file_ranges),
+                max(row_range.to for row_range in file_ranges),
+            )
+        ]
+        if self._row_ranges is not None:
+            ranges = Range.and_(ranges, self._row_ranges)
+        return self._expand_ranges(ranges)
+
+    def _selected_row_ids(self, file: DataFileMeta) -> List[int]:
+        ranges = [file.row_id_range()]
+        if self._row_ranges is not None:
+            ranges = Range.and_(ranges, self._row_ranges)
+        return self._expand_ranges(ranges)
+
+    @staticmethod
+    def _expand_ranges(ranges: List[Range]) -> List[int]:
+        return [
+            row_id
+            for row_range in ranges
+            for row_id in range(row_range.from_, row_range.to + 1)
+        ]
+
+    def _read_blob_values(self, file: DataFileMeta, supplier: Callable) -> List[object]:
+        reader = supplier()
+        if reader is None:
+            return []
+        self._readers.append(reader)
+        try:
+            iterator = BlobRecordIterator(
+                reader._file_io,
+                reader.file_path,
+                reader.blob_lengths,
+                reader.blob_offsets,
+                self._field_name,
+                reader._input_stream,
+            )
+            return [row.values[0] for row in iterator]
+        except AttributeError as e:
+            raise TypeError("Blob fallback reader expects FormatBlobReader suppliers.") from e
+
+    def close(self) -> None:
+        for reader in self._readers:
+            reader.close()
+        self._readers = []

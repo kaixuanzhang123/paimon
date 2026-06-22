@@ -42,6 +42,7 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
+import org.apache.paimon.operation.BlobFileContext;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReaderIterator;
@@ -271,13 +272,15 @@ public class KeyValueFileReadWriteTest {
                         IOManager.create(tempDir.toString()),
                         0,
                         fileFormat,
+                        null,
+                        10,
                         10,
                         10,
                         schema,
                         null,
                         0,
                         new BucketedAppendCompactManager(
-                                null, toCompact, null, 4, 10, false, null, null), // not used
+                                null, toCompact, null, 4, 10, 7, false, null, null), // not used
                         null,
                         false,
                         dataFilePathFactory,
@@ -291,7 +294,8 @@ public class KeyValueFileReadWriteTest {
                         new FileIndexOptions(),
                         true,
                         false,
-                        null);
+                        options.dataEvolutionEnabled(),
+                        BlobFileContext.create(schema, options));
         appendOnlyWriter.setMemoryPool(
                 new HeapMemorySegmentPool(options.writeBufferSize(), options.pageSize()));
         appendOnlyWriter.write(
@@ -304,11 +308,16 @@ public class KeyValueFileReadWriteTest {
     }
 
     protected KeyValueFileWriterFactory createWriterFactory(String pathStr, String format) {
+        Options options = new Options();
+        options.set(CoreOptions.METADATA_STATS_MODE, "FULL");
+        return createWriterFactory(pathStr, format, options);
+    }
+
+    protected KeyValueFileWriterFactory createWriterFactory(
+            String pathStr, String format, Options options) {
         Path path = new Path(pathStr);
         int suggestedFileSize = ThreadLocalRandom.current().nextInt(8192) + 1024;
         FileIO fileIO = FileIOFinder.find(path);
-        Options options = new Options();
-        options.set(CoreOptions.METADATA_STATS_MODE, "FULL");
 
         Function<String, FileStorePathFactory> pathFactoryMap =
                 format1 ->
@@ -325,6 +334,7 @@ public class KeyValueFileReadWriteTest {
                                 null,
                                 null,
                                 CoreOptions.ExternalPathStrategy.NONE,
+                                null,
                                 false,
                                 null);
 
@@ -447,6 +457,49 @@ public class KeyValueFileReadWriteTest {
         // expected.level == eachFile.level
         for (DataFileMeta meta : actual) {
             assertThat(meta.level()).isEqualTo(expected.level());
+        }
+    }
+
+    @Test
+    void testChangelogFile() throws Exception {
+        Options options = new Options();
+        options.set(CoreOptions.METADATA_STATS_MODE, "FULL");
+        options.setString("file-index.bloom-filter.columns", "comment");
+        options.setString("file-index.in-manifest-threshold", "1B");
+
+        KeyValueFileWriterFactory writerFactory =
+                createWriterFactory(tempDir.toString(), "avro", options);
+
+        DataFileTestDataGenerator.Data data = gen.next();
+        RollingFileWriter<KeyValue, DataFileMeta> dataWriter =
+                writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
+        dataWriter.write(CloseableIterator.fromList(data.content, kv -> {}));
+        dataWriter.close();
+        List<DataFileMeta> dataFileMetas = dataWriter.result();
+
+        assertThat(dataFileMetas).isNotEmpty();
+        assertThat(
+                        dataFileMetas.stream()
+                                .anyMatch(
+                                        meta ->
+                                                meta.extraFiles().stream()
+                                                        .anyMatch(
+                                                                f ->
+                                                                        f.endsWith(
+                                                                                DataFilePathFactory
+                                                                                        .INDEX_PATH_SUFFIX))))
+                .isTrue();
+
+        RollingFileWriter<KeyValue, DataFileMeta> changelogWriter =
+                writerFactory.createRollingChangelogFileWriter(0);
+        changelogWriter.write(CloseableIterator.fromList(data.content, kv -> {}));
+        changelogWriter.close();
+        List<DataFileMeta> changelogMetas = changelogWriter.result();
+
+        assertThat(changelogMetas).isNotEmpty();
+        for (DataFileMeta meta : changelogMetas) {
+            assertThat(meta.extraFiles())
+                    .noneMatch(f -> f.endsWith(DataFilePathFactory.INDEX_PATH_SUFFIX));
         }
     }
 

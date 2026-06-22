@@ -65,7 +65,7 @@ public class SnapshotManager implements Serializable {
 
     public static final String SNAPSHOT_PREFIX = "snapshot-";
 
-    public static final int EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM = 3;
+    public static final int EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM = 300;
 
     private final FileIO fileIO;
     private final Path tablePath;
@@ -232,22 +232,30 @@ public class SnapshotManager implements Serializable {
             return null;
         }
 
+        return retryEarliestSnapshot(snapshotId, stopSnapshotId, this::tryGetSnapshot);
+    }
+
+    public static Snapshot retryEarliestSnapshot(
+            long earliestSnapshotId,
+            @Nullable Long stopSnapshotId,
+            FunctionWithException<Long, Snapshot, FileNotFoundException> snapshotFunction) {
         if (stopSnapshotId == null) {
-            stopSnapshotId = snapshotId + EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM;
+            stopSnapshotId = earliestSnapshotId + EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM;
         }
 
+        long snapshotId = earliestSnapshotId;
         do {
             try {
-                return tryGetSnapshot(snapshotId);
+                return snapshotFunction.apply(snapshotId);
             } catch (FileNotFoundException e) {
                 snapshotId++;
                 if (snapshotId > stopSnapshotId) {
-                    return null;
+                    throw new RuntimeException(
+                            String.format(
+                                    "Cannot find earliest snapshot from #%s to #%s.",
+                                    earliestSnapshotId, stopSnapshotId),
+                            e);
                 }
-                LOG.warn(
-                        "The earliest snapshot or changelog was once identified but disappeared. "
-                                + "It might have been expired by other jobs operating on this table. "
-                                + "Searching for the second earliest snapshot or changelog instead. ");
             }
         } while (true);
     }
@@ -272,11 +280,12 @@ public class SnapshotManager implements Serializable {
         }
 
         for (long snapshotId = latestId; snapshotId >= earliestId; snapshotId--) {
-            if (snapshotExists(snapshotId)) {
-                Snapshot snapshot = snapshot(snapshotId);
+            try {
+                Snapshot snapshot = tryGetSnapshot(snapshotId);
                 if (predicate.test(snapshot)) {
                     return snapshot.id();
                 }
+            } catch (FileNotFoundException ignored) {
             }
         }
 
@@ -318,7 +327,7 @@ public class SnapshotManager implements Serializable {
     }
 
     /**
-     * Returns a {@link Snapshot} whoes commit time is later than or equal to given timestamp mills.
+     * Returns a {@link Snapshot} whose commit time is later than or equal to given timestamp mills.
      * If there is no such a snapshot, returns null.
      */
     public @Nullable Snapshot laterOrEqualTimeMills(long timestampMills) {
@@ -587,40 +596,26 @@ public class SnapshotManager implements Serializable {
     }
 
     public Optional<Snapshot> latestSnapshotOfUser(String user) {
-        return latestSnapshotOfUser(user, latestSnapshotId());
+        return latestSnapshotOfUser(user, latestSnapshotId(), null);
     }
 
     public Optional<Snapshot> latestSnapshotOfUserFromFilesystem(String user) {
-        return latestSnapshotOfUser(user, latestSnapshotIdFromFileSystem());
+        return latestSnapshotOfUser(user, latestSnapshotIdFromFileSystem(), null);
     }
 
-    private Optional<Snapshot> latestSnapshotOfUser(String user, Long latestId) {
+    public Optional<Snapshot> latestSnapshotOfUser(
+            String user, Long latestId, @Nullable Long earliestId) {
         if (latestId == null) {
             return Optional.empty();
         }
 
-        long earliestId =
-                Preconditions.checkNotNull(
-                        earliestSnapshotId(),
-                        "Latest snapshot id is not null, but earliest snapshot id is null. "
-                                + "This is unexpected.");
-        for (long id = latestId; id >= earliestId; id--) {
+        long searchEnd = earliestId != null ? earliestId : Snapshot.FIRST_SNAPSHOT_ID;
+        for (long id = latestId; id >= searchEnd; id--) {
             Snapshot snapshot;
             try {
-                snapshot = snapshot(id);
-            } catch (Exception e) {
-                long newEarliestId =
-                        Preconditions.checkNotNull(
-                                earliestSnapshotId(),
-                                "Latest snapshot id is not null, but earliest snapshot id is null. "
-                                        + "This is unexpected.");
-
-                // this is a valid snapshot, should throw exception
-                if (id >= newEarliestId) {
-                    throw e;
-                }
-
-                // this is an expired snapshot
+                snapshot = tryGetSnapshot(id);
+            } catch (FileNotFoundException e) {
+                // this snapshot has been expired, stop searching
                 LOG.warn(
                         "Snapshot #"
                                 + id
@@ -628,6 +623,7 @@ public class SnapshotManager implements Serializable {
                                 + user
                                 + ") is not found.");
                 break;
+                // other exceptions will be thrown
             }
 
             if (user.equals(snapshot.commitUser())) {

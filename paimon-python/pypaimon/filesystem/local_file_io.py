@@ -1,40 +1,38 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import logging
 import os
 import shutil
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import pyarrow
-import pyarrow.fs
+import pyarrow.fs as pafs
 
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.options import Options
 from pypaimon.common.uri_reader import UriReaderFactory
 from pypaimon.filesystem.local import PaimonLocalFileSystem
 from pypaimon.schema.data_types import DataField, AtomicType, PyarrowFieldParser
-from pypaimon.table.row.blob import BlobData, BlobDescriptor, Blob
-from pypaimon.table.row.generic_row import GenericRow
-from pypaimon.table.row.row_kind import RowKind
 from pypaimon.write.blob_format_writer import BlobFormatWriter
 
 
@@ -117,11 +115,12 @@ class LocalFileIO(FileIO):
                 stat_info = file_path.stat()
                 self.path = str(file_path.absolute())
                 self.original_path = original_path
+                self.base_name = os.path.basename(original_path)
                 self.size = stat_info.st_size if file_path.is_file() else None
                 self.type = (
-                    pyarrow.fs.FileType.Directory if file_path.is_dir()
-                    else pyarrow.fs.FileType.File if file_path.is_file()
-                    else pyarrow.fs.FileType.NotFound
+                    pafs.FileType.Directory if file_path.is_dir()
+                    else pafs.FileType.File if file_path.is_file()
+                    else pafs.FileType.NotFound
                 )
                 self.mtime = stat_info.st_mtime
         
@@ -316,6 +315,8 @@ class LocalFileIO(FileIO):
             if parent and not parent.exists():
                 parent.mkdir(parents=True, exist_ok=True)
             
+            data = self._cast_time_columns_for_orc(data)
+            
             with open(file_path, 'wb') as f:
                 if sys.version_info[:2] == (3, 6):
                     orc.write_table(data, f, **kwargs)
@@ -337,7 +338,13 @@ class LocalFileIO(FileIO):
         def record_generator():
             num_rows = len(list(records_dict.values())[0])
             for i in range(num_rows):
-                yield {col: records_dict[col][i] for col in records_dict.keys()}
+                record = {}
+                for col in records_dict.keys():
+                    value = records_dict[col][i]
+                    if isinstance(value, datetime) and value.tzinfo is None:
+                        value = value.replace(tzinfo=timezone.utc)
+                    record[col] = value
+                yield record
         
         records = record_generator()
         
@@ -385,15 +392,61 @@ class LocalFileIO(FileIO):
         except Exception as e:
             self.delete_quietly(path)
             raise RuntimeError(f"Failed to write Lance file {path}: {e}") from e
-    
-    def write_blob(self, path: str, data: pyarrow.Table, blob_as_descriptor: bool, **kwargs):
+
+    def write_mosaic(self, path: str, data: pyarrow.Table, **kwargs):
+        try:
+            import mosaic
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'wb') as f:
+                mosaic.write_table(data, f)
+        except Exception as e:
+            self.delete_quietly(path)
+            raise RuntimeError(f"Failed to write Mosaic file {path}: {e}") from e
+
+    def write_vortex(self, path: str, data: pyarrow.Table, **kwargs):
+        try:
+            import vortex
+            from vortex._lib.io import write as vortex_write
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            from pypaimon.read.reader.vortex_utils import to_vortex_specified
+            _, store_kwargs = to_vortex_specified(self, path)
+
+            if store_kwargs:
+                from vortex import store
+                vortex_store = store.from_url(path, **store_kwargs)
+                vortex_store.write(vortex.array(data))
+            else:
+                vortex_write(vortex.array(data), path)
+        except Exception as e:
+            self.delete_quietly(path)
+            raise RuntimeError(f"Failed to write Vortex file {path}: {e}") from e
+
+    def write_row(self, path: str, data: pyarrow.Table, fields=None, zstd_level: int = 1, **kwargs):
+        try:
+            from pypaimon.write.writer.format_row_writer import FormatRowWriter
+            from pypaimon.schema.data_types import PyarrowFieldParser
+
+            if fields is None:
+                fields = PyarrowFieldParser.to_paimon_schema(data.schema)
+
+            file_path = self._to_file(path)
+            parent = file_path.parent
+            if parent and not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
+
+            with open(file_path, 'wb') as output_stream:
+                writer = FormatRowWriter(output_stream, fields, zstd_level=zstd_level)
+                writer.write_table(data)
+                writer.close()
+        except Exception as e:
+            self.delete_quietly(path)
+            raise RuntimeError(f"Failed to write row file {path}: {e}") from e
+
+    def write_blob(self, path: str, data: pyarrow.Table, **kwargs):
         try:
             if data.num_columns != 1:
                 raise RuntimeError(f"Blob format only supports a single column, got {data.num_columns} columns")
-            
-            column = data.column(0)
-            if column.null_count > 0:
-                raise RuntimeError("Blob format does not support null values")
             
             field = data.schema[0]
             if pyarrow.types.is_large_binary(field.type):
@@ -414,26 +467,32 @@ class LocalFileIO(FileIO):
             with open(file_path, 'wb') as output_stream:
                 writer = BlobFormatWriter(output_stream)
                 for i in range(num_rows):
-                    col_data = records_dict[field_name][i]
-                    if hasattr(fields[0].type, 'type') and fields[0].type.type == "BLOB":
-                        if blob_as_descriptor:
-                            blob_descriptor = BlobDescriptor.deserialize(col_data)
-                            uri_reader = self.uri_reader_factory.create(blob_descriptor.uri)
-                            blob_data = Blob.from_descriptor(uri_reader, blob_descriptor)
-                        elif isinstance(col_data, bytes):
-                            blob_data = BlobData(col_data)
-                        else:
-                            if hasattr(col_data, 'as_py'):
-                                col_data = col_data.as_py()
-                            if isinstance(col_data, str):
-                                col_data = col_data.encode('utf-8')
-                            blob_data = BlobData(col_data)
-                        row_values = [blob_data]
-                    else:
-                        row_values = [col_data]
-                    row = GenericRow(row_values, fields, RowKind.INSERT)
-                    writer.add_element(row)
+                    writer.write_value(records_dict[field_name][i], fields, self.uri_reader_factory)
                 writer.close()
         except Exception as e:
             self.delete_quietly(path)
             raise RuntimeError(f"Failed to write blob file {path}: {e}") from e
+
+
+class FuseLocalFileIO(LocalFileIO):
+    """LocalFileIO that translates remote OSS paths to FUSE-mounted local paths.
+
+    All file operations receive paths like:
+        oss://clg-paimon-xxx/db-xxx/tbl-xxx/manifest/manifest-xxx
+    This class replaces the path prefix with fuse_path so the actual
+    I/O goes through the FUSE mount point.
+    """
+
+    def __init__(self, path: str, fuse_path: str,
+                 catalog_options: Optional[Options] = None):
+        super().__init__(path=fuse_path, catalog_options=catalog_options)
+        self.path = path
+        self.fuse_path = fuse_path
+
+    def _to_file(self, path: str) -> Path:
+        return super()._to_file(self._translate(path))
+
+    def _translate(self, path: str) -> str:
+        if path == self.path or path.startswith(self.path + "/"):
+            return self.fuse_path + path[len(self.path):]
+        return path

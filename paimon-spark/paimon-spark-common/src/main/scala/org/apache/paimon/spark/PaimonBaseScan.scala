@@ -18,14 +18,18 @@
 
 package org.apache.paimon.spark
 
-import org.apache.paimon.annotation.VisibleForTesting
+import org.apache.paimon.CoreOptions
+import org.apache.paimon.globalindex.GlobalIndexResult
+import org.apache.paimon.partition.PartitionPredicate
+import org.apache.paimon.predicate.PredicateBuilder
 import org.apache.paimon.spark.metric.SparkMetricRegistry
-import org.apache.paimon.spark.scan.BaseScan
+import org.apache.paimon.spark.read.{BaseScan, BatchReadTagCleanupListener, PaimonSupportsRuntimeFiltering, SparkHybridSearchBuilderImpl, SparkVectorSearchBuilderImpl}
 import org.apache.paimon.spark.sources.PaimonMicroBatchStream
 import org.apache.paimon.spark.util.OptionUtils
 import org.apache.paimon.table.{DataTable, FileStoreTable, InnerTable}
-import org.apache.paimon.table.source.{InnerTableScan, Split}
+import org.apache.paimon.table.source.{DataTableBatchScan, InnerTableScan, Split}
 
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
 import org.apache.spark.sql.connector.read.Batch
@@ -33,34 +37,109 @@ import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
 
 import scala.collection.JavaConverters._
 
-abstract class PaimonBaseScan(table: InnerTable) extends BaseScan with SQLConfHelper {
+abstract class PaimonBaseScan(table: InnerTable)
+  extends BaseScan
+  with PaimonSupportsRuntimeFiltering
+  with SQLConfHelper {
 
   private lazy val paimonMetricsRegistry: SparkMetricRegistry = SparkMetricRegistry()
 
-  // May recalculate the splits after executing runtime filter push down.
-  protected var _inputSplits: Array[Split] = _
-  protected var _inputPartitions: Seq[PaimonInputPartition] = _
+  protected def getInputSplits: Array[Split] = {
+    val scan = readBuilder
+      .newScan()
+      .withGlobalIndexResult(evalGlobalIndexSearch())
+      .asInstanceOf[InnerTableScan]
+      .withMetricRegistry(paimonMetricsRegistry)
 
-  @VisibleForTesting
-  def inputSplits: Array[Split] = {
-    if (_inputSplits == null) {
-      _inputSplits = readBuilder
-        .newScan()
-        .asInstanceOf[InnerTableScan]
-        .withMetricRegistry(paimonMetricsRegistry)
-        .plan()
-        .splits()
-        .asScala
-        .toArray
+    val plan = scan.plan()
+
+    Option(scan.readProtectionTagName).foreach {
+      name =>
+        BatchReadTagCleanupListener
+          .getOrCreate(SparkSession.active)
+          .registerCleanup(name, table)
     }
-    _inputSplits
+
+    plan.splits().asScala.toArray
   }
 
-  final override def inputPartitions: Seq[PaimonInputPartition] = {
-    if (_inputPartitions == null) {
-      _inputPartitions = getInputPartitions(inputSplits)
+  private def evalGlobalIndexSearch(): GlobalIndexResult = {
+    val globalSearchCount =
+      Seq(pushedVectorSearch, pushedHybridSearch, pushedFullTextSearch).count(_.isDefined)
+    if (globalSearchCount > 1) {
+      throw new UnsupportedOperationException(
+        "Cannot push down vector search, hybrid search and full-text search simultaneously.")
     }
-    _inputPartitions
+    if (pushedVectorSearch.isDefined) {
+      return evalVectorSearch()
+    }
+    if (pushedHybridSearch.isDefined) {
+      return evalHybridSearch()
+    }
+    if (pushedFullTextSearch.isDefined) {
+      return evalFullTextSearch()
+    }
+    null
+  }
+
+  private def evalVectorSearch(): GlobalIndexResult = {
+    val vectorSearch = pushedVectorSearch.get
+    val vectorSearchBuilder =
+      if (CoreOptions.fromMap(table.options).vectorSearchDistributeEnabled()) {
+        new SparkVectorSearchBuilderImpl(table)
+      } else {
+        table.newVectorSearchBuilder()
+      }
+    val vectorBuilder = vectorSearchBuilder
+      .withVector(vectorSearch.vector())
+      .withVectorColumn(vectorSearch.fieldName())
+      .withLimit(vectorSearch.limit())
+      .withOptions(vectorSearch.options())
+    if (pushedPartitionFilters.nonEmpty) {
+      vectorBuilder.withPartitionFilter(PartitionPredicate.and(pushedPartitionFilters.asJava))
+    }
+    if (pushedDataFilters.nonEmpty) {
+      vectorBuilder.withFilter(PredicateBuilder.and(pushedDataFilters.asJava))
+    }
+    vectorBuilder.newVectorRead().read(vectorBuilder.newVectorScan().scan())
+  }
+
+  private def evalHybridSearch(): GlobalIndexResult = {
+    val hybridSearch = pushedHybridSearch.get
+    val hybridSearchBuilder =
+      if (CoreOptions.fromMap(table.options).vectorSearchDistributeEnabled()) {
+        new SparkHybridSearchBuilderImpl(table)
+      } else {
+        table.newHybridSearchBuilder()
+      }
+    val builder = hybridSearchBuilder
+      .withLimit(hybridSearch.limit())
+      .withRanker(hybridSearch.ranker())
+    hybridSearch.routes().asScala.foreach(route => builder.addRoute(route))
+    if (pushedPartitionFilters.nonEmpty) {
+      builder.withPartitionFilter(PartitionPredicate.and(pushedPartitionFilters.asJava))
+    }
+    if (pushedDataFilters.nonEmpty) {
+      builder.withFilter(PredicateBuilder.and(pushedDataFilters.asJava))
+    }
+    builder.executeLocal()
+  }
+
+  private def evalFullTextSearch(): GlobalIndexResult = {
+    val fullTextSearch = pushedFullTextSearch.get
+    val ftBuilder = table
+      .newFullTextSearchBuilder()
+      .withQuery(fullTextSearch.query())
+      .withLimit(fullTextSearch.limit())
+    if (pushedPartitionFilters.nonEmpty) {
+      ftBuilder.withPartitionFilter(PartitionPredicate.and(pushedPartitionFilters.asJava))
+    }
+    if (pushedDataFilters.nonEmpty) {
+      throw new UnsupportedOperationException(
+        "Full-text search does not support non-partition filters because full-text indexes " +
+          "cannot apply row-id pre-filters before top-k ranking.")
+    }
+    ftBuilder.newFullTextRead().read(ftBuilder.newFullTextScan().scan())
   }
 
   override def toBatch: Batch = {

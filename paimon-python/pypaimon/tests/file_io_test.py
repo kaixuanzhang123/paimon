@@ -1,20 +1,20 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import os
 import shutil
 import tempfile
@@ -22,21 +22,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pyarrow
-from pyarrow.fs import S3FileSystem
+import pyarrow.fs as pafs
 
 from pypaimon.common.options import Options
+from pypaimon.common.options.config import OssOptions
 from pypaimon.filesystem.local_file_io import LocalFileIO
-from pypaimon.filesystem.pyarrow_file_io import PyArrowFileIO
+from pypaimon.filesystem.pyarrow_file_io import PyArrowFileIO, _pyarrow_lt_7
 
 
 class FileIOTest(unittest.TestCase):
     """Test cases for FileIO.to_filesystem_path method."""
 
-    def test_s3_filesystem_path_conversion(self):
+    def test_filesystem_path_conversion(self):
         """Test S3FileSystem path conversion with various formats."""
         file_io = PyArrowFileIO("s3://bucket/warehouse", Options({}))
-        self.assertIsInstance(file_io.filesystem, S3FileSystem)
+        self.assertIsInstance(file_io.filesystem, pafs.S3FileSystem)
 
         # Test bucket and path
         self.assertEqual(file_io.to_filesystem_path("s3://my-bucket/path/to/file.txt"),
@@ -64,6 +64,80 @@ class FileIOTest(unittest.TestCase):
         self.assertEqual(file_io.to_filesystem_path(converted_path), converted_path)
         parent_str = str(Path(converted_path).parent)
         self.assertEqual(file_io.to_filesystem_path(parent_str), parent_str)
+
+        lt7 = _pyarrow_lt_7()
+        oss_io = PyArrowFileIO("oss://test-bucket/warehouse", Options({
+            OssOptions.OSS_ENDPOINT.key(): 'oss-cn-hangzhou.aliyuncs.com',
+            OssOptions.OSS_ACCESS_KEY_ID.key(): 'test-key',
+            OssOptions.OSS_ACCESS_KEY_SECRET.key(): 'test-secret',
+            OssOptions.OSS_IMPL.key(): 'legacy',
+        }))
+        got = oss_io.to_filesystem_path("oss://test-bucket/path/to/file.txt")
+        self.assertEqual(got, "path/to/file.txt" if lt7 else "test-bucket/path/to/file.txt")
+        if lt7:
+            self.assertEqual(oss_io.to_filesystem_path("db-xxx.db/tbl-xxx/data.parquet"),
+                             "db-xxx.db/tbl-xxx/data.parquet")
+            self.assertEqual(oss_io.to_filesystem_path("db-xxx.db/tbl-xxx"), "db-xxx.db/tbl-xxx")
+            manifest_uri = "oss://test-bucket/warehouse/db.db/table/manifest/manifest-list-abc-0"
+            manifest_key = oss_io.to_filesystem_path(manifest_uri)
+            self.assertEqual(manifest_key, "warehouse/db.db/table/manifest/manifest-list-abc-0",
+                             "OSS+PyArrow6 must pass key only to PyArrow so manifest is written to correct bucket")
+            self.assertFalse(manifest_key.startswith("test-bucket/"),
+                             "path must not start with bucket name or PyArrow 6 writes to wrong bucket")
+        nf = MagicMock(type=pafs.FileType.NotFound)
+        get_file_info_calls = []
+
+        def record_get_file_info(paths):
+            get_file_info_calls.append(list(paths))
+            return [MagicMock(type=pafs.FileType.NotFound) for _ in paths]
+
+        mock_fs = MagicMock()
+        mock_fs.get_file_info.side_effect = record_get_file_info if lt7 else [[nf], [nf]]
+        mock_fs.create_dir = MagicMock()
+        mock_fs.open_output_stream.return_value = MagicMock()
+        oss_io.filesystem = mock_fs
+        oss_io.new_output_stream("oss://test-bucket/path/to/file.txt")
+        mock_fs.create_dir.assert_called_once()
+        path_str = oss_io.to_filesystem_path("oss://test-bucket/path/to/file.txt")
+        if lt7:
+            expected_parent = '/'.join(path_str.split('/')[:-1]) if '/' in path_str else ''
+        else:
+            expected_parent = "/".join(path_str.split("/")[:-1]) if "/" in path_str else str(Path(path_str).parent)
+        self.assertEqual(mock_fs.create_dir.call_args[0][0], expected_parent)
+        if lt7:
+            for call_paths in get_file_info_calls:
+                for p in call_paths:
+                    self.assertFalse(
+                        p.startswith("test-bucket/"),
+                        "OSS+PyArrow<7 must pass key only to get_file_info, not bucket/key. Got: %r" % (p,)
+                    )
+
+    def test_exists(self):
+        lt7 = _pyarrow_lt_7()
+        with tempfile.TemporaryDirectory(prefix="file_io_nonexistent_") as tmpdir:
+            file_io = LocalFileIO("file://" + tmpdir, Options({}))
+            missing_uri = "file://" + os.path.join(tmpdir, "nonexistent_xyz")
+            path_str = file_io.to_filesystem_path(missing_uri)
+            raised = None
+            infos = None
+            try:
+                infos = file_io.filesystem.get_file_info([path_str])
+            except OSError as e:
+                raised = e
+            if lt7:
+                if raised is not None:
+                    err = str(raised).lower()
+                    self.assertTrue("133" in err or "does not exist" in err or "not exist" in err, str(raised))
+                else:
+                    self.assertEqual(len(infos), 1)
+                    self.assertEqual(infos[0].type, pafs.FileType.NotFound)
+            else:
+                self.assertIsNone(raised)
+                self.assertEqual(len(infos), 1)
+                self.assertEqual(infos[0].type, pafs.FileType.NotFound)
+            self.assertFalse(file_io.exists(missing_uri))
+            with self.assertRaises(FileNotFoundError):
+                file_io.get_file_status(missing_uri)
 
     def test_local_filesystem_path_conversion(self):
         file_io = LocalFileIO("file:///tmp/warehouse", Options({}))
@@ -213,6 +287,18 @@ class FileIOTest(unittest.TestCase):
 
             file_io.delete_quietly("file:///some/path")
             file_io.delete_directory_quietly("file:///some/path")
+
+            oss_io = PyArrowFileIO("oss://test-bucket/warehouse", Options({
+                OssOptions.OSS_ENDPOINT.key(): 'oss-cn-hangzhou.aliyuncs.com',
+                OssOptions.OSS_ACCESS_KEY_ID.key(): 'test-key',
+                OssOptions.OSS_ACCESS_KEY_SECRET.key(): 'test-secret',
+                OssOptions.OSS_IMPL.key(): 'legacy',
+            }))
+            mock_fs = MagicMock()
+            mock_fs.get_file_info.return_value = [
+                MagicMock(type=pafs.FileType.NotFound)]
+            oss_io.filesystem = mock_fs
+            self.assertFalse(oss_io.exists("oss://test-bucket/path/to/file.txt"))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -297,7 +383,7 @@ class FileIOTest(unittest.TestCase):
                 f.write("test content")
             
             file_info = file_io.get_file_status(f"file://{test_file}")
-            self.assertEqual(file_info.type, pyarrow.fs.FileType.File)
+            self.assertEqual(file_info.type, pafs.FileType.File)
             self.assertIsNotNone(file_info.size)
 
             with self.assertRaises(FileNotFoundError) as context:
@@ -377,6 +463,162 @@ class FileIOTest(unittest.TestCase):
                 self.assertEqual(f.read(), "test content")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_path_on_windows(self):
+        oss_io = PyArrowFileIO("oss://test-bucket/warehouse", Options({
+            OssOptions.OSS_ENDPOINT.key(): 'oss-cn-hangzhou.aliyuncs.com',
+            OssOptions.OSS_ACCESS_KEY_ID.key(): 'test-key',
+            OssOptions.OSS_ACCESS_KEY_SECRET.key(): 'test-secret',
+            OssOptions.OSS_IMPL.key(): 'legacy',
+        }))
+        mock_fs = MagicMock()
+        mock_fs.get_file_info.return_value = [MagicMock(type=pafs.FileType.NotFound)]
+        mock_fs.create_dir = MagicMock()
+        mock_fs.open_output_stream.return_value = MagicMock()
+        mock_fs.move = MagicMock()
+        mock_fs.copy_file = MagicMock()
+        oss_io.filesystem = mock_fs
+
+        oss_io.new_output_stream("oss://test-bucket/db.db/tbl/bucket-0/data.parquet")
+        oss_io.rename("oss://test-bucket/db.db/tbl/old.parquet",
+                      "oss://test-bucket/db.db/tbl/new.parquet")
+        oss_io.copy_file("oss://test-bucket/db.db/tbl/src.parquet",
+                         "oss://test-bucket/db.db/tbl/dst.parquet")
+
+        for call in mock_fs.create_dir.call_args_list:
+            self.assertNotIn("\\", call[0][0], f"backslash in path: {call[0][0]}")
+
+
+class HdfsFileIOTest(unittest.TestCase):
+    """Cases for HDFS / ViewFS URI handling in PyArrowFileIO._initialize_hdfs_fs."""
+
+    def _make_hdfs_env(self, env_patch):
+        env_patch.setdefault('HADOOP_HOME', '/opt/hadoop')
+        env_patch.setdefault('HADOOP_CONF_DIR', '/opt/hadoop/etc/hadoop')
+        env_patch.setdefault('CLASSPATH', '')
+        env_patch.setdefault('LD_LIBRARY_PATH', '')
+        return env_patch
+
+    def _make_file_io(self):
+        file_io = PyArrowFileIO.__new__(PyArrowFileIO)
+        file_io.properties = Options({})
+        return file_io
+
+    @patch('pypaimon.filesystem.pyarrow_file_io.subprocess.run')
+    @patch('pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem')
+    def test_viewfs_uses_default_host(self, mock_hadoop_fs, mock_run):
+        mock_run.return_value = MagicMock(stdout='/opt/hadoop/share/hadoop/common/*')
+        mock_hadoop_fs.return_value = MagicMock()
+        with patch.dict(os.environ, self._make_hdfs_env({}), clear=True):
+            self._make_file_io()._initialize_hdfs_fs('viewfs', 'clusterName')
+        mock_hadoop_fs.assert_called_once_with(host='default', port=0, user='hadoop')
+
+    @patch('pypaimon.filesystem.pyarrow_file_io.subprocess.run')
+    @patch('pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem')
+    def test_viewfs_without_netloc_uses_default_host(self, mock_hadoop_fs, mock_run):
+        mock_run.return_value = MagicMock(stdout='/opt/hadoop/share/hadoop/common/*')
+        mock_hadoop_fs.return_value = MagicMock()
+        with patch.dict(os.environ, self._make_hdfs_env({}), clear=True):
+            self._make_file_io()._initialize_hdfs_fs('viewfs', '')
+        mock_hadoop_fs.assert_called_once_with(host='default', port=0, user='hadoop')
+
+    @patch('pypaimon.filesystem.pyarrow_file_io.subprocess.run')
+    @patch('pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem')
+    def test_hdfs_with_port_uses_explicit_host(self, mock_hadoop_fs, mock_run):
+        mock_run.return_value = MagicMock(stdout='/opt/hadoop/share/hadoop/common/*')
+        mock_hadoop_fs.return_value = MagicMock()
+        with patch.dict(os.environ, self._make_hdfs_env({}), clear=True):
+            self._make_file_io()._initialize_hdfs_fs('hdfs', 'namenode:8020')
+        mock_hadoop_fs.assert_called_once_with(host='namenode', port=8020, user='hadoop')
+
+    @patch('pypaimon.filesystem.pyarrow_file_io.subprocess.run')
+    @patch('pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem')
+    def test_hdfs_ha_nameservice_without_port_uses_default_host(self, mock_hadoop_fs, mock_run):
+        mock_run.return_value = MagicMock(stdout='/opt/hadoop/share/hadoop/common/*')
+        mock_hadoop_fs.return_value = MagicMock()
+        with patch.dict(os.environ, self._make_hdfs_env({}), clear=True):
+            self._make_file_io()._initialize_hdfs_fs('hdfs', 'nameservice1')
+        mock_hadoop_fs.assert_called_once_with(host='default', port=0, user='hadoop')
+
+    @patch('pypaimon.filesystem.pyarrow_file_io.subprocess.run')
+    @patch('pypaimon.filesystem.pyarrow_file_io.pafs.HadoopFileSystem')
+    def test_hdfs_without_netloc_uses_default_host(self, mock_hadoop_fs, mock_run):
+        mock_run.return_value = MagicMock(stdout='/opt/hadoop/share/hadoop/common/*')
+        mock_hadoop_fs.return_value = MagicMock()
+        with patch.dict(os.environ, self._make_hdfs_env({}), clear=True):
+            self._make_file_io()._initialize_hdfs_fs('hdfs', '')
+        mock_hadoop_fs.assert_called_once_with(host='default', port=0, user='hadoop')
+
+    def test_hdfs_missing_hadoop_home_raises(self):
+        with patch.dict(os.environ, {'HADOOP_CONF_DIR': '/opt/hadoop/etc/hadoop'}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._make_file_io()._initialize_hdfs_fs('hdfs', 'namenode:8020')
+            self.assertIn('HADOOP_HOME', str(ctx.exception))
+
+    def test_hdfs_missing_hadoop_conf_dir_raises(self):
+        with patch.dict(os.environ, {'HADOOP_HOME': '/opt/hadoop'}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._make_file_io()._initialize_hdfs_fs('hdfs', 'namenode:8020')
+            self.assertIn('HADOOP_CONF_DIR', str(ctx.exception))
+
+
+@unittest.skipUnless(hasattr(pafs, 'GcsFileSystem'), "PyArrow GCS support not available")
+class GCSFileIOPathTest(unittest.TestCase):
+    """Unit tests for PyArrowFileIO.to_filesystem_path with GCS (no credentials required)."""
+
+    def setUp(self):
+        self.file_io = PyArrowFileIO("gs://my-bucket/warehouse", Options({}))
+
+    def test_gcs_filesystem_type(self):
+        """GCS warehouse path should produce a GcsFileSystem."""
+        self.assertIsInstance(self.file_io.filesystem, pafs.GcsFileSystem)
+
+    def test_gcs_path_conversion(self):
+        """gs://bucket/key should map to bucket/key (no leading slash)."""
+        self.assertEqual(
+            self.file_io.to_filesystem_path("gs://my-bucket/path/to/file.parquet"),
+            "my-bucket/path/to/file.parquet"
+        )
+        self.assertEqual(
+            self.file_io.to_filesystem_path("gs://my-bucket/warehouse/db.db/tbl/data-0.parquet"),
+            "my-bucket/warehouse/db.db/tbl/data-0.parquet"
+        )
+
+    def test_gcs_path_bucket_only(self):
+        """gs://bucket with no path should return just the bucket name."""
+        self.assertEqual(
+            self.file_io.to_filesystem_path("gs://my-bucket"),
+            "my-bucket"
+        )
+
+    def test_gcs_path_normalization(self):
+        """Multiple consecutive slashes in the path should be collapsed."""
+        self.assertEqual(
+            self.file_io.to_filesystem_path("gs://my-bucket///path///to///file.parquet"),
+            "my-bucket/path/to/file.parquet"
+        )
+
+    def test_gcs_path_idempotency(self):
+        """Already-converted bucket/key paths should pass through unchanged."""
+        converted = "my-bucket/path/to/file.parquet"
+        self.assertEqual(self.file_io.to_filesystem_path(converted), converted)
+        parent = str(Path(converted).parent)
+        self.assertEqual(self.file_io.to_filesystem_path(parent), parent)
+
+    def test_gcs_path_no_leading_slash(self):
+        """to_filesystem_path must never return a path starting with '/'."""
+        cases = [
+            "gs://my-bucket/path/to/file.parquet",
+            "gs://my-bucket",
+            "gs://my-bucket///path",
+        ]
+        for uri in cases:
+            result = self.file_io.to_filesystem_path(uri)
+            self.assertFalse(
+                result.startswith("/"),
+                f"Path must not start with '/' for GcsFileSystem, got: {result!r} (input: {uri!r})"
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,23 +1,23 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from typing import List
+from typing import Callable, List, Optional
 
 import fastavro
 
@@ -28,7 +28,8 @@ from pypaimon.manifest.schema.manifest_entry import (MANIFEST_ENTRY_SCHEMA,
                                                      ManifestEntry)
 from pypaimon.manifest.schema.manifest_file_meta import ManifestFileMeta
 from pypaimon.manifest.schema.simple_stats import SimpleStats
-from pypaimon.table.row.generic_row import (GenericRowDeserializer,
+from pypaimon.table.row.generic_row import (GenericRow,
+                                            GenericRowDeserializer,
                                             GenericRowSerializer)
 from pypaimon.table.row.binary_row import BinaryRow
 
@@ -48,20 +49,23 @@ class ManifestFileManager:
         self.trimmed_primary_keys_fields = self.table.trimmed_primary_keys_fields
 
     def read_entries_parallel(self, manifest_files: List[ManifestFileMeta], manifest_entry_filter=None,
-                              drop_stats=True, max_workers=8) -> List[ManifestEntry]:
+                              drop_stats=True, max_workers=8,
+                              early_entry_filter: Optional[Callable[[int, int], bool]] = None
+                              ) -> List[ManifestEntry]:
 
         def _process_single_manifest(manifest_file: ManifestFileMeta) -> List[ManifestEntry]:
-            return self.read(manifest_file.file_name, manifest_entry_filter, drop_stats)
+            return self.read(manifest_file.file_name, manifest_entry_filter, drop_stats,
+                             early_entry_filter=early_entry_filter)
 
-        def _entry_identifier(entry: ManifestEntry) -> tuple:
+        def _entry_identifier(e: ManifestEntry) -> tuple:
             return (
-                tuple(entry.partition.values),
-                entry.bucket,
-                entry.file.level,
-                entry.file.file_name,
-                tuple(entry.file.extra_files) if entry.file.extra_files else (),
-                entry.file.embedded_index,
-                entry.file.external_path,
+                tuple(e.partition.values),
+                e.bucket,
+                e.file.level,
+                e.file.file_name,
+                tuple(e.file.extra_files) if e.file.extra_files else (),
+                e.file.embedded_index,
+                e.file.external_path,
             )
 
         deleted_entry_keys = set()
@@ -81,7 +85,19 @@ class ManifestFileManager:
         ]
         return final_entries
 
-    def read(self, manifest_file_name: str, manifest_entry_filter=None, drop_stats=True) -> List[ManifestEntry]:
+    def read(self, manifest_file_name: str, manifest_entry_filter=None, drop_stats=True,
+             early_entry_filter: Optional[Callable[[int, int], bool]] = None
+             ) -> List[ManifestEntry]:
+        """
+        early_entry_filter: optional ``(bucket, total_buckets) -> bool``
+        called immediately after the avro record is parsed. Mirrors
+        Java ``BucketFilter`` applied at the InternalRow stage in
+        ``ManifestEntryCache``: when it returns False, the entry's
+        ``_FILE`` block / partition / stats are never deserialized.
+        Caller is responsible for soundness (any non-pruning rule must
+        return True). The full ``manifest_entry_filter`` still runs on
+        the survivors.
+        """
         manifest_file_path = f"{self.manifest_path}/{manifest_file_name}"
 
         entries = []
@@ -91,6 +107,15 @@ class ManifestFileManager:
         reader = fastavro.reader(buffer)
 
         for record in reader:
+            if early_entry_filter is not None:
+                try:
+                    bucket = record['_BUCKET']
+                    total_buckets = record['_TOTAL_BUCKETS']
+                except KeyError:
+                    pass
+                else:
+                    if not early_entry_filter(bucket, total_buckets):
+                        continue
             file_dict = dict(record['_FILE'])
             key_dict = dict(file_dict['_KEY_STATS'])
             key_stats = SimpleStats(
@@ -99,7 +124,11 @@ class ManifestFileManager:
                 null_counts=key_dict['_NULL_COUNTS'],
             )
 
-            schema_fields = self.table.schema_manager.get_schema(file_dict['_SCHEMA_ID']).fields
+            schema_id = file_dict['_SCHEMA_ID']
+            if schema_id == self.table.table_schema.id:
+                schema_fields = self.table.table_schema.fields
+            else:
+                schema_fields = self.table.schema_manager.get_schema(schema_id).fields
             fields = self._get_value_stats_fields(file_dict, schema_fields)
             value_dict = dict(file_dict['_VALUE_STATS'])
             value_stats = SimpleStats(
@@ -166,7 +195,10 @@ class ManifestFileManager:
                     fields = schema_fields
                 else:
                     read_fields = file_dict['_WRITE_COLS']
-                    fields = [self.table.field_dict[col] for col in read_fields]
+                    # writeCols may contain metadata fields (e.g. _ROW_ID, _SEQUENCE_NUMBER)
+                    data_field_dict = {f.name: f for f in schema_fields}
+                    fields = [data_field_dict[col] for col in read_fields
+                              if col in data_field_dict]
             else:
                 fields = schema_fields
         elif not file_dict['_VALUE_STATS_COLS']:
@@ -227,3 +259,61 @@ class ManifestFileManager:
         except Exception as e:
             self.file_io.delete_quietly(manifest_path)
             raise RuntimeError(f"Failed to write manifest file: {e}") from e
+
+    def write_with_meta(self, file_name, entries: List[ManifestEntry]) -> ManifestFileMeta:
+        self.write(file_name, entries)
+        added_file_count = 0
+        deleted_file_count = 0
+        schema_id = None
+        for entry in entries:
+            if entry.kind == 0:
+                added_file_count += 1
+            else:
+                deleted_file_count += 1
+            schema_id = entry.file.schema_id if schema_id is None else max(schema_id, entry.file.schema_id)
+        if schema_id is None:
+            schema_id = self.table.table_schema.id
+
+        partition_columns = list(zip(*(entry.partition.values for entry in entries))) if entries else []
+        partition_null_counts = [sum(1 for value in col if value is None) for col in partition_columns]
+        partition_min_stats = [
+            min((v for v in col if v is not None), default=None) for col in partition_columns
+        ]
+        partition_max_stats = [
+            max((v for v in col if v is not None), default=None) for col in partition_columns
+        ]
+
+        min_row_id = None
+        max_row_id = None
+        for entry in entries:
+            if entry.file.first_row_id is None:
+                min_row_id = None
+                max_row_id = None
+                break
+            file_range = entry.file.row_id_range()
+            if min_row_id is None or file_range.from_ < min_row_id:
+                min_row_id = file_range.from_
+            if max_row_id is None or file_range.to > max_row_id:
+                max_row_id = file_range.to
+
+        manifest_file_path = f"{self.manifest_path}/{file_name}"
+        return ManifestFileMeta(
+            file_name=file_name,
+            file_size=self.table.file_io.get_file_size(manifest_file_path),
+            num_added_files=added_file_count,
+            num_deleted_files=deleted_file_count,
+            partition_stats=SimpleStats(
+                min_values=GenericRow(
+                    values=partition_min_stats,
+                    fields=self.table.partition_keys_fields
+                ),
+                max_values=GenericRow(
+                    values=partition_max_stats,
+                    fields=self.table.partition_keys_fields
+                ),
+                null_counts=partition_null_counts,
+            ),
+            schema_id=schema_id,
+            min_row_id=min_row_id,
+            max_row_id=max_row_id,
+        )

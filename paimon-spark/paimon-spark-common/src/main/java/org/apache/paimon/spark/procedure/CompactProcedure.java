@@ -184,9 +184,10 @@ public class CompactProcedure extends BaseProcedure {
                 partitions == null || where == null,
                 "partitions and where cannot be used together.");
         String finalWhere = partitions != null ? SparkProcedureUtils.toWhere(partitions) : where;
-        return modifyPaimonTable(
+        return modifySparkTable(
                 tableIdent,
-                t -> {
+                sparkTable -> {
+                    org.apache.paimon.table.Table t = sparkTable.getTable();
                     checkArgument(t instanceof FileStoreTable);
                     FileStoreTable table = (FileStoreTable) t;
                     CoreOptions coreOptions = table.coreOptions();
@@ -195,7 +196,7 @@ public class CompactProcedure extends BaseProcedure {
                             "order_by should not contain partition cols, because it is meaningless, your order_by cols are %s, and partition cols are %s",
                             sortColumns,
                             table.partitionKeys());
-                    DataSourceV2Relation relation = createRelation(tableIdent);
+                    DataSourceV2Relation relation = createRelation(tableIdent, sparkTable);
                     PartitionPredicate partitionPredicate =
                             SparkProcedureUtils.convertToPartitionPredicate(
                                     finalWhere,
@@ -277,6 +278,11 @@ public class CompactProcedure extends BaseProcedure {
                         compactUnAwareBucketTable(
                                 table, partitionPredicate, partitionIdleTime, javaSparkContext);
                     }
+                    break;
+                case POSTPONE_MODE:
+                    SparkPostponeCompactProcedure.apply(
+                                    table, spark(), partitionPredicate, relation)
+                            .execute();
                     break;
                 default:
                     throw new UnsupportedOperationException(
@@ -486,7 +492,7 @@ public class CompactProcedure extends BaseProcedure {
             JavaSparkContext javaSparkContext) {
         List<DataEvolutionCompactTask> compactionTasks;
         DataEvolutionCompactCoordinator compactCoordinator =
-                new DataEvolutionCompactCoordinator(table, partitionPredicate, false);
+                new DataEvolutionCompactCoordinator(table, partitionPredicate, false, false);
         CommitMessageSerializer messageSerializerser = new CommitMessageSerializer();
         String commitUser = createCommitUser(table.coreOptions().toConfiguration());
         try {
@@ -608,6 +614,9 @@ public class CompactProcedure extends BaseProcedure {
             List<String> sortColumns,
             DataSourceV2Relation relation,
             @Nullable PartitionPredicate partitionPredicate) {
+        if (table.coreOptions().dataEvolutionEnabled()) {
+            throw new UnsupportedOperationException("Data Evolution table cannot be sorted!");
+        }
         SnapshotReader snapshotReader = table.newSnapshotReader();
         if (partitionPredicate != null) {
             snapshotReader.withPartitionFilter(partitionPredicate);
@@ -659,6 +668,9 @@ public class CompactProcedure extends BaseProcedure {
                 incrementalClusterManager.clusterCurve(),
                 incrementalClusterManager.clusterKeys());
 
+        CoreOptions.ClusteringIncrementalMode mode =
+                incrementalClusterManager.clusteringIncrementalMode();
+
         Dataset<Row> datasetForWrite =
                 partitionSplits.values().stream()
                         .map(Pair::getKey)
@@ -670,7 +682,12 @@ public class CompactProcedure extends BaseProcedure {
                                                     ScanPlanHelper$.MODULE$.createNewScanPlan(
                                                             splits.toArray(new DataSplit[0]),
                                                             relation));
-                                    return sorter.sort(dataset);
+                                    // Use sortLocal() for LOCAL_SORT, sort() for GLOBAL_SORT
+                                    if (mode == CoreOptions.ClusteringIncrementalMode.LOCAL_SORT) {
+                                        return sorter.sortLocal(dataset);
+                                    } else {
+                                        return sorter.sort(dataset);
+                                    }
                                 })
                         .reduce(Dataset::union)
                         .orElse(null);

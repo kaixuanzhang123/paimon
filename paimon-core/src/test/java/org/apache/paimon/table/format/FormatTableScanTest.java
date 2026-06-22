@@ -24,6 +24,7 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
 import org.apache.paimon.format.csv.CsvOptions;
 import org.apache.paimon.format.json.JsonOptions;
+import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.partition.PartitionPredicate;
@@ -49,10 +50,13 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.apache.paimon.CoreOptions.FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH;
 import static org.apache.paimon.CoreOptions.SOURCE_SPLIT_TARGET_SIZE;
 import static org.apache.paimon.utils.PartitionPathUtils.searchPartSpecAndPaths;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -231,6 +235,31 @@ public class FormatTableScanTest {
         expectPartitionSpec.put("month", "12");
         assertThat(searched.get(0).getLeft()).isEqualTo(expectPartitionSpec);
         assertThat(searched.size()).isEqualTo(1);
+    }
+
+    @TestTemplate
+    void testComputeScanPathWithDateEqualityFilter() {
+        Path tableLocation = new Path(tmpPath.toUri());
+        RowType datePartitionType = RowType.builder().field("dt", DataTypes.DATE()).build();
+        List<String> datePartitionKeys = datePartitionType.getFieldNames();
+
+        PredicateBuilder builder = new PredicateBuilder(datePartitionType);
+        Predicate equalityPredicate =
+                builder.equal(0, (int) java.time.LocalDate.parse("2026-05-01").toEpochDay());
+        PartitionPredicate partitionFilter =
+                PartitionPredicate.fromPredicate(datePartitionType, equalityPredicate);
+
+        Pair<Path, Integer> result =
+                FormatTableScan.computeScanPathAndLevel(
+                        tableLocation,
+                        datePartitionKeys,
+                        partitionFilter,
+                        datePartitionType,
+                        enablePartitionValueOnly);
+        String partitionPath = enablePartitionValueOnly ? "2026-05-01" : "dt=2026-05-01";
+
+        assertThat(result.getLeft().toString()).isEqualTo(tableLocation + partitionPath);
+        assertThat(result.getRight()).isEqualTo(0);
     }
 
     @TestTemplate
@@ -550,7 +579,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, equalityPredicate);
+                        partitionKeys, equalityPredicate, type);
 
         assertThat(result).hasSize(3);
         assertThat(result.get("year")).isEqualTo("2023");
@@ -577,7 +606,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, mixedPredicate);
+                        partitionKeys, mixedPredicate, type);
 
         assertThat(result).isNotNull();
         assertThat(result).hasSize(2);
@@ -605,7 +634,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, mixedPredicate);
+                        partitionKeys, mixedPredicate, type);
         assertThat(result).hasSize(1);
         assertThat(result.get("year")).isEqualTo("2023");
         assertThat(result.containsKey("month")).isFalse();
@@ -631,7 +660,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, mixedPredicate);
+                        partitionKeys, mixedPredicate, type);
 
         assertThat(result).isEmpty();
     }
@@ -652,7 +681,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, nonEqualityPredicate);
+                        partitionKeys, nonEqualityPredicate, type);
 
         assertThat(result).isEmpty();
     }
@@ -672,7 +701,7 @@ public class FormatTableScanTest {
 
         Map<String, String> result =
                 FormatTableScan.extractLeadingEqualityPartitionSpecWhenOnlyAnd(
-                        partitionKeys, orPredicate);
+                        partitionKeys, orPredicate, type);
 
         assertThat(result).isEmpty();
     }
@@ -756,8 +785,9 @@ public class FormatTableScanTest {
         // Parquet files should NOT be split, should be a single split
         assertThat(splits).hasSize(1);
         FormatDataSplit split = (FormatDataSplit) splits.get(0);
-        assertThat(split.filePath()).isEqualTo(parquetFile);
-        assertThat(split.offset()).isEqualTo(0);
+        assertThat(split.files()).hasSize(1);
+        assertThat(split.files().get(0).filePath()).isEqualTo(parquetFile);
+        assertThat(split.files().get(0).offset()).isEqualTo(0);
     }
 
     @TestTemplate
@@ -801,5 +831,107 @@ public class FormatTableScanTest {
                 .format(format)
                 .options(options)
                 .build();
+    }
+
+    @TestTemplate
+    void testSearchPartSpecAndPathsWithRangeFilter() throws IOException {
+        Path tableLocation = new Path(tmpPath.toUri());
+        LocalFileIO fileIO = LocalFileIO.create();
+
+        // Create partition directories for years 2022 to 2026
+        for (int year = 2022; year <= 2026; year++) {
+            String partPath = enablePartitionValueOnly ? String.valueOf(year) : "year=" + year;
+            for (int month = 1; month <= 12; month++) {
+                String monthPart =
+                        enablePartitionValueOnly
+                                ? partPath + "/" + month
+                                : partPath + "/month=" + month;
+                fileIO.mkdirs(new Path(tableLocation, monthPart));
+            }
+        }
+
+        AtomicInteger atomicInteger = new AtomicInteger(0);
+        LocalFileIO localFileIO =
+                new LocalFileIO() {
+                    @Override
+                    public FileStatus[] listStatus(Path path) throws IOException {
+                        atomicInteger.getAndIncrement();
+                        return super.listStatus(path);
+                    }
+                };
+
+        RowType rowType =
+                RowType.builder()
+                        .field("year", DataTypes.INT())
+                        .field("month", DataTypes.INT())
+                        .field("a", DataTypes.INT())
+                        .build();
+
+        FormatTable formatTable =
+                FormatTable.builder()
+                        .fileIO(localFileIO)
+                        .identifier(Identifier.create("test_db", "test_table"))
+                        .rowType(rowType)
+                        .partitionKeys(Arrays.asList("year", "month"))
+                        .location(tableLocation.toString())
+                        .format(FormatTable.Format.CSV)
+                        .options(
+                                Collections.singletonMap(
+                                        FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH.key(),
+                                        String.valueOf(enablePartitionValueOnly)))
+                        .build();
+
+        // Create predicate: year > 2022 AND year < 2026
+        PredicateBuilder builder = new PredicateBuilder(formatTable.partitionType());
+        Predicate predicate =
+                PredicateBuilder.and(builder.greaterThan(0, 2022), builder.lessThan(0, 2026));
+
+        FormatTableScan scan =
+                ((FormatTableScan) formatTable.newReadBuilder().withFilter(predicate).newScan());
+        List<Pair<LinkedHashMap<String, String>, Path>> result = scan.findPartitions();
+
+        // Should find years 2023, 2024, 2025
+        assertEquals(36, result.size());
+        assertEquals(4, atomicInteger.get());
+        List<String> years =
+                result.stream()
+                        .map(pair -> pair.getKey().get("year"))
+                        .sorted()
+                        .distinct()
+                        .collect(java.util.stream.Collectors.toList());
+        assertEquals(Arrays.asList("2023", "2024", "2025"), years);
+
+        atomicInteger.set(0);
+        predicate = PredicateBuilder.and(builder.greaterThan(1, 3), builder.lessThan(1, 10));
+        predicate = PredicateBuilder.and(predicate, builder.equal(0, 2024));
+
+        scan = ((FormatTableScan) formatTable.newReadBuilder().withFilter(predicate).newScan());
+        result = scan.findPartitions();
+        assertEquals(6, result.size());
+        // equals predicate reduce 1 io
+        assertEquals(1, atomicInteger.get());
+        List<String> month =
+                result.stream()
+                        .map(pair -> pair.getKey().get("month"))
+                        .sorted()
+                        .distinct()
+                        .collect(java.util.stream.Collectors.toList());
+        assertEquals(Arrays.asList("4", "5", "6", "7", "8", "9"), month);
+
+        atomicInteger.set(0);
+        predicate = PredicateBuilder.and(builder.greaterThan(1, 3), builder.lessThan(1, 10));
+
+        scan = ((FormatTableScan) formatTable.newReadBuilder().withFilter(predicate).newScan());
+        result = scan.findPartitions();
+        assertEquals(30, result.size());
+        // equals predicate reduce 1 io
+        assertEquals(6, atomicInteger.get());
+        month =
+                result.stream()
+                        .map(pair -> pair.getKey().get("month"))
+                        .sorted()
+                        .distinct()
+                        .collect(java.util.stream.Collectors.toList());
+        assertEquals(Arrays.asList("4", "5", "6", "7", "8", "9"), month);
     }
 }

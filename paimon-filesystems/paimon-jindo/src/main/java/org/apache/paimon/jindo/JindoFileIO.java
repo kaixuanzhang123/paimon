@@ -20,11 +20,13 @@ package org.apache.paimon.jindo;
 
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.HadoopOptionsProvider;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.TwoPhaseOutputStream;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.StringUtils;
 
 import com.aliyun.jindodata.common.JindoHadoopSystem;
 import com.aliyun.jindodata.dls.JindoDlsFileSystem;
@@ -47,7 +49,7 @@ import java.util.function.Supplier;
 import static org.apache.paimon.options.CatalogOptions.FILE_IO_ALLOW_CACHE;
 
 /** Jindo {@link FileIO}. */
-public class JindoFileIO extends HadoopCompliantFileIO {
+public class JindoFileIO extends HadoopCompliantFileIO implements HadoopOptionsProvider {
 
     private static final long serialVersionUID = 2L;
 
@@ -64,6 +66,9 @@ public class JindoFileIO extends HadoopCompliantFileIO {
     private static final String OSS_ACCESS_KEY_ID = "fs.oss.accessKeyId";
     private static final String OSS_ACCESS_KEY_SECRET = "fs.oss.accessKeySecret";
     private static final String OSS_SECURITY_TOKEN = "fs.oss.securityToken";
+    private static final String OSS_USER_AGENT_EXTENDED = "fs.oss.user.agent.extended";
+    private static final String DLF_ACCESS_TRACKING_EXTENDED_INFO =
+            "dlf.access-tracking.extended-info";
 
     private static final Map<String, String> CASE_SENSITIVE_KEYS =
             new HashMap<String, String>() {
@@ -130,6 +135,18 @@ public class JindoFileIO extends HadoopCompliantFileIO {
                     .forEachRemaining(entry -> hadoopOptions.set(entry.getKey(), entry.getValue()));
         }
 
+        String dlfAccessTrackingExtendedInfo =
+                context.options().get(DLF_ACCESS_TRACKING_EXTENDED_INFO);
+        if (!StringUtils.isNullOrWhitespaceOnly(dlfAccessTrackingExtendedInfo)) {
+            LOG.info("Adding DLF access tracking extended info: {}", dlfAccessTrackingExtendedInfo);
+            String existedUserAgentExtended = hadoopOptions.get(OSS_USER_AGENT_EXTENDED);
+            hadoopOptions.set(
+                    OSS_USER_AGENT_EXTENDED,
+                    StringUtils.isNullOrWhitespaceOnly(existedUserAgentExtended)
+                            ? dlfAccessTrackingExtendedInfo
+                            : existedUserAgentExtended + " " + dlfAccessTrackingExtendedInfo);
+        }
+
         // another config when enable cache
         hadoopOptionsWithCache = new Options(hadoopOptions.toMap());
         hadoopOptionsWithCache.set("fs.xengine", "jindocache");
@@ -150,6 +167,7 @@ public class JindoFileIO extends HadoopCompliantFileIO {
      * @param opType read/write/meta
      * @return
      */
+    @Override
     public Options hadoopOptions(Path path, String opType) {
         boolean shouldCache = false;
         if (opType.equalsIgnoreCase("read")) {

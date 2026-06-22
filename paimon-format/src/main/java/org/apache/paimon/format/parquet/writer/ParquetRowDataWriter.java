@@ -20,6 +20,7 @@ package org.apache.paimon.format.parquet.writer;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.Blob;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
@@ -39,6 +40,7 @@ import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.io.api.Binary;
@@ -105,6 +107,8 @@ public class ParquetRowDataWriter {
                 case BINARY:
                 case VARBINARY:
                     return new BinaryWriter();
+                case BLOB:
+                    return new BlobDescriptorWriter();
                 case DECIMAL:
                     DecimalType decimalType = (DecimalType) t;
                     return createDecimalWriter(decimalType.getPrecision(), decimalType.getScale());
@@ -135,9 +139,15 @@ public class ParquetRowDataWriter {
             GroupType groupType = type.asGroupType();
             LogicalTypeAnnotation annotation = type.getLogicalTypeAnnotation();
 
-            if (t instanceof ArrayType
+            if ((t instanceof ArrayType || t instanceof VectorType)
                     && annotation instanceof LogicalTypeAnnotation.ListLogicalTypeAnnotation) {
-                return new ArrayWriter(((ArrayType) t).getElementType(), groupType);
+                DataType elementType =
+                        t instanceof ArrayType
+                                ? ((ArrayType) t).getElementType()
+                                : ((VectorType) t).getElementType();
+                Integer expectedVectorLength =
+                        t instanceof VectorType ? ((VectorType) t).getLength() : null;
+                return new ArrayWriter(elementType, groupType, expectedVectorLength);
             } else if (t instanceof MapType
                     && annotation instanceof LogicalTypeAnnotation.MapLogicalTypeAnnotation) {
                 return new MapWriter(
@@ -313,6 +323,33 @@ public class ParquetRowDataWriter {
         }
     }
 
+    /** Writes inline BLOB bytes as serialized descriptor or view struct. */
+    private class BlobDescriptorWriter implements FieldWriter {
+
+        @Override
+        public void write(InternalRow row, int ordinal) {
+            writeBlob(row.getBlob(ordinal));
+        }
+
+        @Override
+        public void write(InternalArray arrayData, int ordinal) {
+            // Currently we don't support BLOB inside arrays/maps.
+            throw new UnsupportedOperationException("BLOB in array is not supported.");
+        }
+
+        private void writeBlob(Blob blob) {
+            try {
+                recordConsumer.addBinary(Binary.fromReusedByteArray(Blob.serializeBlob(blob)));
+            } catch (Throwable t) {
+                throw new IllegalArgumentException(
+                        "BLOB inline fields configured by blob-descriptor-field or "
+                                + "blob-view-field require values to be a BlobDescriptor or "
+                                + "BlobViewStruct.",
+                        t);
+            }
+        }
+    }
+
     private class IntWriter implements FieldWriter {
 
         @Override
@@ -481,8 +518,10 @@ public class ParquetRowDataWriter {
         private final String elementName;
         private final FieldWriter elementWriter;
         private final String repeatedGroupName;
+        @Nullable private final Integer expectedVectorLength;
 
-        private ArrayWriter(DataType t, GroupType groupType) {
+        private ArrayWriter(
+                DataType t, GroupType groupType, @Nullable Integer expectedVectorLength) {
             // Get the internal array structure
             GroupType repeatedType = groupType.getType(0).asGroupType();
             this.repeatedGroupName = repeatedType.getName();
@@ -491,21 +530,34 @@ public class ParquetRowDataWriter {
             this.elementName = elementType.getName();
 
             this.elementWriter = createWriter(t, elementType);
+            this.expectedVectorLength = expectedVectorLength;
         }
 
         @Override
         public void write(InternalRow row, int ordinal) {
-            writeArrayData(row.getArray(ordinal));
+            writeArrayData(
+                    expectedVectorLength != null ? row.getVector(ordinal) : row.getArray(ordinal));
         }
 
         @Override
         public void write(InternalArray arrayData, int ordinal) {
-            writeArrayData(arrayData.getArray(ordinal));
+            writeArrayData(
+                    expectedVectorLength != null
+                            ? arrayData.getVector(ordinal)
+                            : arrayData.getArray(ordinal));
         }
 
         private void writeArrayData(InternalArray arrayData) {
             recordConsumer.startGroup();
             int listLength = arrayData.size();
+
+            if (expectedVectorLength != null && listLength != expectedVectorLength) {
+                throw new IllegalArgumentException(
+                        "Vector length mismatch: expected "
+                                + expectedVectorLength
+                                + " but got "
+                                + listLength);
+            }
 
             if (listLength > 0) {
                 recordConsumer.startField(repeatedGroupName, 0);

@@ -114,6 +114,16 @@ class PredicateJsonSerdeTest {
                         .expectJson(
                                 "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"UPPER\",\"inputs\":[{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}]},\"function\":\"STARTS_WITH\",\"literals\":[\"ABC\"]}"),
 
+                // LeafPredicate - UpperTransform
+                TestSpec.forPredicate(
+                                builder.startsWith(
+                                        new LowerTransform(
+                                                Collections.singletonList(
+                                                        new FieldRef(2, "f2", DataTypes.STRING()))),
+                                        BinaryString.fromString("abc")))
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"LOWER\",\"inputs\":[{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}]},\"function\":\"STARTS_WITH\",\"literals\":[\"abc\"]}"),
+
                 // LeafPredicate - ConcatTransform
                 TestSpec.forPredicate(
                                 builder.contains(
@@ -145,6 +155,41 @@ class PredicateJsonSerdeTest {
                 TestSpec.forPredicate(builder.like(2, BinaryString.fromString("%a%b%")))
                         .expectJson(
                                 "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}},\"function\":\"LIKE\",\"literals\":[\"%a%b%\"]}"),
+
+                // LeafPredicate - StartsWith (field index)
+                TestSpec.forPredicate(builder.startsWith(2, BinaryString.fromString("hello")))
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}},\"function\":\"STARTS_WITH\",\"literals\":[\"hello\"]}"),
+
+                // LeafPredicate - EndsWith (field index)
+                TestSpec.forPredicate(builder.endsWith(2, BinaryString.fromString("world")))
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}},\"function\":\"ENDS_WITH\",\"literals\":[\"world\"]}"),
+
+                // LeafPredicate - Contains (field index)
+                TestSpec.forPredicate(builder.contains(2, BinaryString.fromString("foo")))
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":2,\"name\":\"f2\",\"type\":\"STRING\"}},\"function\":\"CONTAINS\",\"literals\":[\"foo\"]}"),
+
+                // LeafPredicate - Between
+                TestSpec.forPredicate(builder.between(0, 3, 7))
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":0,\"name\":\"f0\",\"type\":\"INT\"}},\"function\":\"BETWEEN\",\"literals\":[3,7]}"),
+
+                // LeafPredicate - NotBetween (negate of Between)
+                TestSpec.forPredicate(builder.between(0, 3, 7).negate().get())
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"FIELD_REF\",\"fieldRef\":{\"index\":0,\"name\":\"f0\",\"type\":\"INT\"}},\"function\":\"NOT_BETWEEN\",\"literals\":[3,7]}"),
+
+                // LeafPredicate - AlwaysTrue
+                TestSpec.forPredicate(PredicateBuilder.alwaysTrue())
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"NULL\"},\"function\":\"TRUE\",\"literals\":[]}"),
+
+                // LeafPredicate - AlwaysFalse
+                TestSpec.forPredicate(PredicateBuilder.alwaysFalse())
+                        .expectJson(
+                                "{\"kind\":\"LEAF\",\"transform\":{\"name\":\"NULL\"},\"function\":\"FALSE\",\"literals\":[]}"),
 
                 // LeafPredicate - In with many values including nulls
                 TestSpec.forPredicate(

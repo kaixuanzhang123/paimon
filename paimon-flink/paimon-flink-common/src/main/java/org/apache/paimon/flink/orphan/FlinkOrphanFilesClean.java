@@ -282,15 +282,26 @@ public class FlinkOrphanFilesClean extends OrphanFilesClean {
                                         Path dirPath = new Path(dir);
                                         List<FileStatus> files = tryBestListingDirs(dirPath);
                                         for (FileStatus file : files) {
-                                            if (oldEnough(file)) {
+                                            if (!file.isDir() && oldEnough(file)) {
                                                 out.collect(
                                                         Tuple2.of(
-                                                                file.getPath().toUri().toString(),
+                                                                file.getPath().toString(),
                                                                 file.getLen()));
                                             }
                                         }
                                         if (files.isEmpty()) {
-                                            ctx.output(emptyDirOutputTag, dirPath);
+                                            try {
+                                                FileStatus dirStatus =
+                                                        fileIO.getFileStatus(dirPath);
+                                                if (oldEnough(dirStatus)) {
+                                                    ctx.output(emptyDirOutputTag, dirPath);
+                                                }
+                                            } catch (IOException e) {
+                                                LOG.warn(
+                                                        "IOException during check dirStatus for {}, ignore it",
+                                                        dirPath,
+                                                        e);
+                                            }
                                         }
                                     }
                                 })
@@ -313,9 +324,12 @@ public class FlinkOrphanFilesClean extends OrphanFilesClean {
                             @Override
                             public void endInput() throws IOException {
                                 // delete empty dir
-                                while (!emptyDirs.isEmpty()) {
+                                while (!dryRun && !emptyDirs.isEmpty()) {
                                     Set<Path> newEmptyDir = new HashSet<>();
                                     for (Path emptyDir : emptyDirs) {
+                                        if (table.location().equals(emptyDir)) {
+                                            continue;
+                                        }
                                         try {
                                             if (fileIO.delete(emptyDir, false)) {
                                                 LOG.info("Clean empty dir: {}", emptyDir);

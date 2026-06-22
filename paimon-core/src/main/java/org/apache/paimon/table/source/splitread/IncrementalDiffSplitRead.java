@@ -110,7 +110,7 @@ public class IncrementalDiffSplitRead implements SplitRead<InternalRow> {
                     ProjectedRow.from(readType, mergeRead.tableSchema().logicalRowType());
             reader = reader.transform(kv -> kv.replaceValue(projectedRow.replaceRow(kv.value())));
         }
-        return KeyValueTableRead.unwrap(reader);
+        return KeyValueTableRead.unwrap(reader, mergeRead.tableSchema().options());
     }
 
     private static RecordReader<KeyValue> readDiff(
@@ -206,10 +206,8 @@ public class IncrementalDiffSplitRead implements SplitRead<InternalRow> {
             } else if (kvs.size() == 2) {
                 KeyValue before = kvs.get(0);
                 KeyValue after = kvs.get(1);
-                if (after.level() == AFTER_LEVEL) {
-                    if (!valueAndRowKindEquals(before, after)) {
-                        toReturn = after;
-                    }
+                if (!valueAndRowKindEquals(before, after)) {
+                    toReturn = after.level() == AFTER_LEVEL ? after : before;
                 }
             } else {
                 throw new IllegalArgumentException("Illegal kv number: " + kvs.size());

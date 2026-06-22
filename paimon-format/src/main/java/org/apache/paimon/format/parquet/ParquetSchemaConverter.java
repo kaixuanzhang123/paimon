@@ -31,6 +31,7 @@ import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
+import org.apache.paimon.types.VectorType;
 import org.apache.paimon.utils.Pair;
 
 import org.apache.parquet.schema.ConversionPatterns;
@@ -90,6 +91,7 @@ public class ParquetSchemaConverter {
                         .withId(fieldId);
             case BINARY:
             case VARBINARY:
+            case BLOB:
                 return Types.primitive(PrimitiveType.PrimitiveTypeName.BINARY, repetition)
                         .named(name)
                         .withId(fieldId);
@@ -158,13 +160,13 @@ public class ParquetSchemaConverter {
                                 name, localZonedTimestampType.getPrecision(), repetition, true)
                         .withId(fieldId);
             case ARRAY:
-                ArrayType arrayType = (ArrayType) type;
+            case VECTOR:
+                DataType listElementType =
+                        type instanceof ArrayType
+                                ? ((ArrayType) type).getElementType()
+                                : ((VectorType) type).getElementType();
                 Type elementParquetType =
-                        convertToParquetType(
-                                        LIST_ELEMENT_NAME,
-                                        arrayType.getElementType(),
-                                        fieldId,
-                                        depth + 1)
+                        convertToParquetType(LIST_ELEMENT_NAME, listElementType, fieldId, depth + 1)
                                 .withId(SpecialFields.getArrayElementFieldId(fieldId, depth + 1));
                 return ConversionPatterns.listOfElements(repetition, name, elementParquetType)
                         .withId(fieldId);
@@ -213,20 +215,32 @@ public class ParquetSchemaConverter {
                         .withId(fieldId);
             case ROW:
                 RowType rowType = (RowType) type;
-                return new GroupType(repetition, name, convertToParquetTypes(rowType))
+                Types.GroupBuilder<GroupType> groupTypeBuilder = Types.buildGroup(repetition);
+                // TODO Use Variant until all engines are upgraded to the latest Parquet
+                // if (VariantMetadataUtils.isVariantRowType(rowType)) {
+                //     groupTypeBuilder.as(
+                //            LogicalTypeAnnotation.variantType(Variant.VARIANT_SPEC_VERSION));
+                // }
+                return groupTypeBuilder
+                        .addFields(convertToParquetTypes(rowType))
+                        .named(name)
                         .withId(fieldId);
             case VARIANT:
                 return Types.buildGroup(repetition)
+                        // TODO Use Variant until all engines are upgraded to the latest Parquet
+                        // .as(LogicalTypeAnnotation.variantType(Variant.VARIANT_SPEC_VERSION))
                         .addField(
                                 Types.primitive(
                                                 PrimitiveType.PrimitiveTypeName.BINARY,
                                                 Type.Repetition.REQUIRED)
-                                        .named(Variant.VALUE))
+                                        .named(Variant.VALUE)
+                                        .withId(0))
                         .addField(
                                 Types.primitive(
                                                 PrimitiveType.PrimitiveTypeName.BINARY,
                                                 Type.Repetition.REQUIRED)
-                                        .named(Variant.METADATA))
+                                        .named(Variant.METADATA)
+                                        .withId(1))
                         .named(name)
                         .withId(fieldId);
             default:
@@ -340,12 +354,16 @@ public class ParquetSchemaConverter {
                             instanceof LogicalTypeAnnotation.TimestampLogicalTypeAnnotation) {
                         LogicalTypeAnnotation.TimestampLogicalTypeAnnotation timestampType =
                                 (LogicalTypeAnnotation.TimestampLogicalTypeAnnotation) logicalType;
-                        int precision =
-                                timestampType
-                                                .getUnit()
-                                                .equals(LogicalTypeAnnotation.TimeUnit.MILLIS)
-                                        ? 3
-                                        : 6;
+                        int precision;
+                        if (timestampType.getUnit().equals(LogicalTypeAnnotation.TimeUnit.MILLIS)) {
+                            precision = 3;
+                        } else if (timestampType
+                                .getUnit()
+                                .equals(LogicalTypeAnnotation.TimeUnit.MICROS)) {
+                            precision = 6;
+                        } else {
+                            precision = 9;
+                        }
                         paimonDataType =
                                 timestampType.isAdjustedToUTC()
                                         ? new LocalZonedTimestampType(precision)

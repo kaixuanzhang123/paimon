@@ -30,12 +30,16 @@ import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.operation.DataEvolutionFileStoreScan.EvolutionStats;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.reader.DataEvolutionArray;
 import org.apache.paimon.reader.DataEvolutionRow;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.RowRangeIndex;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -258,6 +262,117 @@ public class DataEvolutionFileStoreScanTest {
         assertThat(nullCounts.isNullAt(2)).isTrue();
     }
 
+    @Test
+    public void testEvolutionStatsSkipsStatsAfterColumnTypeChange() {
+        Schema baseSchema = createSchema("f0", "f1");
+        TableSchema baseTableSchema = TableSchema.create(0L, baseSchema);
+        schemas.put(0L, baseTableSchema);
+
+        Schema evolvedSchema =
+                Schema.newBuilder()
+                        .column("f0", DataTypes.STRING())
+                        .column("f1", DataTypes.STRING())
+                        .build();
+        TableSchema evolvedTableSchema = TableSchema.create(1L, evolvedSchema);
+        schemas.put(1L, evolvedTableSchema);
+
+        ManifestEntry oldTypeEntry =
+                createManifestEntry(
+                        0L,
+                        createSimpleStats(
+                                GenericRow.of(10, BinaryString.fromString("a")),
+                                GenericRow.of(99, BinaryString.fromString("z")),
+                                createBinaryArray(new int[] {0, 0}),
+                                new int[] {0, 1}));
+
+        BinaryRow newTypeMin = new BinaryRow(2);
+        BinaryRowWriter newTypeMinWriter = new BinaryRowWriter(newTypeMin);
+        newTypeMinWriter.writeString(0, BinaryString.fromString("apple"));
+        newTypeMinWriter.writeString(1, BinaryString.fromString("banana"));
+        newTypeMinWriter.complete();
+        BinaryRow newTypeMax = new BinaryRow(2);
+        BinaryRowWriter newTypeMaxWriter = new BinaryRowWriter(newTypeMax);
+        newTypeMaxWriter.writeString(0, BinaryString.fromString("yam"));
+        newTypeMaxWriter.writeString(1, BinaryString.fromString("zebra"));
+        newTypeMaxWriter.complete();
+        SimpleStats newTypeStats =
+                new SimpleStats(newTypeMin, newTypeMax, createBinaryArray(new int[] {0, 0}));
+        ManifestEntry newTypeEntry = createManifestEntry(1L, newTypeStats);
+
+        EvolutionStats result =
+                DataEvolutionFileStoreScan.evolutionStats(
+                        evolvedTableSchema,
+                        scanTableSchema,
+                        Arrays.asList(oldTypeEntry, newTypeEntry));
+
+        DataEvolutionRow minRow = (DataEvolutionRow) result.minValues();
+        DataEvolutionRow maxRow = (DataEvolutionRow) result.maxValues();
+
+        assertThat(minRow.getString(0).toString()).isEqualTo("apple");
+        assertThat(maxRow.getString(0).toString()).isEqualTo("yam");
+    }
+
+    @Test
+    public void testEvolutionStatsKeepDedicatedVectorFieldAsUnknown() {
+        Schema schema = createSchema("f0", "f1", "f2");
+        TableSchema tableSchema = TableSchema.create(0L, schema);
+        schemas.put(0L, tableSchema);
+
+        ManifestEntry dataEntry =
+                createManifestEntryWithDifferentColsAndFileName(
+                        "data-file.parquet",
+                        0L,
+                        new String[] {"f0", "f1"},
+                        new String[] {"f0", "f1"},
+                        createSimpleStats(
+                                GenericRow.of(1, BinaryString.fromString("a")),
+                                GenericRow.of(3, BinaryString.fromString("c")),
+                                createBinaryArray(new int[] {0, 0}),
+                                new int[] {0, 1}));
+
+        ManifestEntry vectorEntry =
+                createManifestEntryWithDifferentColsAndFileName(
+                        "data-file.vector.avro",
+                        0L,
+                        new String[] {"f2"},
+                        new String[] {"f2"},
+                        createSimpleStats(
+                                GenericRow.of(10),
+                                GenericRow.of(30),
+                                createBinaryArray(new int[] {0}),
+                                new int[] {2}));
+
+        EvolutionStats result =
+                DataEvolutionFileStoreScan.evolutionStats(
+                        tableSchema, scanTableSchema, Arrays.asList(dataEntry, vectorEntry));
+
+        DataEvolutionArray nullCounts = (DataEvolutionArray) result.nullCounts();
+        assertThat(nullCounts.isNullAt(2)).isTrue();
+
+        Predicate predicate = new PredicateBuilder(tableSchema.logicalRowType()).isNotNull(2);
+        assertThat(
+                        predicate.test(
+                                result.rowCount(),
+                                result.minValues(),
+                                result.maxValues(),
+                                result.nullCounts()))
+                .isTrue();
+    }
+
+    @Test
+    public void testIntersectsRowRanges() {
+        List<Range> rowRanges =
+                Arrays.asList(
+                        new Range(20, 30), new Range(0, 10), new Range(5, 15), new Range(35, 40));
+        RowRangeIndex index = RowRangeIndex.create(rowRanges);
+
+        assertThat(index.intersects(14, 14)).isTrue();
+        assertThat(index.intersects(16, 19)).isFalse();
+        assertThat(index.intersects(31, 34)).isFalse();
+        assertThat(index.intersects(29, 31)).isTrue();
+        assertThat(index.intersects(100, 200)).isFalse();
+    }
+
     private Schema createSchema(String... fieldNames) {
         Schema.Builder builder = Schema.newBuilder();
         for (int i = 0; i < fieldNames.length; i++) {
@@ -300,9 +415,19 @@ public class DataEvolutionFileStoreScanTest {
 
     private ManifestEntry createManifestEntryWithDifferentCols(
             Long schemaId, String[] writeCols, String[] valueStatsCols, SimpleStats stats) {
+        return createManifestEntryWithDifferentColsAndFileName(
+                "test-file.parquet", schemaId, writeCols, valueStatsCols, stats);
+    }
+
+    private ManifestEntry createManifestEntryWithDifferentColsAndFileName(
+            String fileName,
+            Long schemaId,
+            String[] writeCols,
+            String[] valueStatsCols,
+            SimpleStats stats) {
         DataFileMeta fileMeta =
                 DataFileMeta.create(
-                        "test-file.parquet",
+                        fileName,
                         100L,
                         100L,
                         createBinaryRow(1),

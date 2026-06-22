@@ -18,6 +18,7 @@
 
 package org.apache.paimon.predicate;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -53,6 +54,10 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
 
     T visitIsNull(FieldRef fieldRef);
 
+    default T visitIsNaN(FieldRef fieldRef) {
+        throw new UnsupportedOperationException();
+    }
+
     // ----------------- Binary functions ------------------------
 
     T visitStartsWith(FieldRef fieldRef, Object literal);
@@ -80,6 +85,16 @@ public interface FunctionVisitor<T> extends PredicateVisitor<T> {
     T visitIn(FieldRef fieldRef, List<Object> literals);
 
     T visitNotIn(FieldRef fieldRef, List<Object> literals);
+
+    default T visitBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitAnd(
+                Arrays.asList(visitGreaterOrEqual(fieldRef, from), visitLessOrEqual(fieldRef, to)));
+    }
+
+    default T visitNotBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitOr(
+                Arrays.asList(visitLessThan(fieldRef, from), visitGreaterThan(fieldRef, to)));
+    }
 
     // ----------------- Compound functions ------------------------
 

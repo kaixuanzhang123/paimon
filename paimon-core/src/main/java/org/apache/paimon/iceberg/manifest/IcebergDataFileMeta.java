@@ -26,6 +26,7 @@ import org.apache.paimon.iceberg.metadata.IcebergDataField;
 import org.apache.paimon.iceberg.metadata.IcebergSchema;
 import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
@@ -86,9 +87,6 @@ public class IcebergDataFileMeta {
     private final String referencedDataFile;
     private final Long contentOffset;
     private final Long contentSizeInBytes;
-
-    // only used for iceberg migrate
-    private long schemaId = 0;
 
     IcebergDataFileMeta(
             Content content,
@@ -183,12 +181,18 @@ public class IcebergDataFileMeta {
             Object minValue = fieldGetter.getFieldOrNull(stats.minValues());
             Object maxValue = fieldGetter.getFieldOrNull(stats.maxValues());
             if (minValue != null && maxValue != null) {
-                lowerBounds.put(
-                        field.id(),
-                        IcebergConversions.toByteBuffer(field.dataType(), minValue).array());
-                upperBounds.put(
-                        field.id(),
-                        IcebergConversions.toByteBuffer(field.dataType(), maxValue).array());
+                DataTypeRoot typeRoot = field.dataType().getTypeRoot();
+                if (typeRoot != DataTypeRoot.ARRAY
+                        && typeRoot != DataTypeRoot.MAP
+                        && typeRoot != DataTypeRoot.ROW
+                        && typeRoot != DataTypeRoot.MULTISET) {
+                    lowerBounds.put(
+                            field.id(),
+                            IcebergConversions.toByteBuffer(field.dataType(), minValue).array());
+                    upperBounds.put(
+                            field.id(),
+                            IcebergConversions.toByteBuffer(field.dataType(), maxValue).array());
+                }
             }
         }
 
@@ -277,15 +281,6 @@ public class IcebergDataFileMeta {
 
     public Long contentSizeInBytes() {
         return contentSizeInBytes;
-    }
-
-    public long schemaId() {
-        return schemaId;
-    }
-
-    public IcebergDataFileMeta withSchemaId(long schemaId) {
-        this.schemaId = schemaId;
-        return this;
     }
 
     public static RowType schema(RowType partitionType) {

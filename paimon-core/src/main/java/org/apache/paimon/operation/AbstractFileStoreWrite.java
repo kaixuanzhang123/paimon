@@ -35,12 +35,14 @@ import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.memory.MemoryPoolFactory;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.operation.metrics.CompactionMetrics;
+import org.apache.paimon.partition.PartitionTimeExtractor;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CommitIncrement;
 import org.apache.paimon.utils.ExecutorThreadFactory;
 import org.apache.paimon.utils.RecordWriter;
+import org.apache.paimon.utils.RowDataToObjectArrayConverter;
 import org.apache.paimon.utils.SnapshotManager;
 
 import org.slf4j.Logger;
@@ -48,15 +50,20 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.paimon.CoreOptions.PARTITION_DEFAULT_NAME;
 import static org.apache.paimon.io.DataFileMeta.getMaxSequenceNumber;
@@ -78,6 +85,8 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
     private final int numBuckets;
     private final RowType partitionType;
 
+    @Nullable private final PartitionTimestampValidator partitionTimestampValidator;
+
     @Nullable protected IOManager ioManager;
 
     protected final Map<BinaryRow, Map<Integer, WriterContainer<T>>> writers;
@@ -88,9 +97,11 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
     private boolean ignorePreviousFiles = false;
     private boolean ignoreNumBucketCheck = false;
 
+    protected final SnapshotManager snapshotManager;
     protected CompactionMetrics compactionMetrics = null;
     protected final String tableName;
     private final boolean legacyPartitionName;
+    private final CoreOptions options;
 
     protected AbstractFileStoreWrite(
             SnapshotManager snapshotManager,
@@ -106,6 +117,7 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
         } else if (dvMaintainerFactory != null) {
             indexFileHandler = dvMaintainerFactory.indexFileHandler();
         }
+        this.snapshotManager = snapshotManager;
         this.restore = new FileSystemWriteRestore(options, snapshotManager, scan, indexFileHandler);
         this.dbMaintainerFactory = dbMaintainerFactory;
         this.dvMaintainerFactory = dvMaintainerFactory;
@@ -115,6 +127,9 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
         this.tableName = tableName;
         this.writerNumberMax = options.writeMaxWritersToSpill();
         this.legacyPartitionName = options.legacyPartitionName();
+        this.options = options;
+        this.partitionTimestampValidator =
+                PartitionTimestampValidator.create(options, partitionType);
     }
 
     @Override
@@ -380,7 +395,10 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
                             state.maxSequenceNumber,
                             state.commitIncrement,
                             compactExecutor(),
-                            state.deletionVectorsMaintainer);
+                            state.deletionVectorsMaintainer,
+                            // Restore reconstructs writer state from checkpointed files, so do
+                            // not ignore them.
+                            false);
             notifyNewWriter(writer);
             WriterContainer<T> writerContainer =
                     new WriterContainer<>(
@@ -423,6 +441,10 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
             LOG.debug("Creating writer for partition {}, bucket {}", partition, bucket);
         }
 
+        if (partitionTimestampValidator != null) {
+            partitionTimestampValidator.validate(partition);
+        }
+
         if (writerNumber() >= writerNumberMax) {
             try {
                 forceBufferSpill();
@@ -431,8 +453,12 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
             }
         }
 
+        Snapshot latestSnapshot = snapshotManager.latestSnapshot();
+        boolean actualIgnorePreviousFiles =
+                ignorePreviousFilesForWriter(
+                        partition, bucket, latestSnapshot, ignorePreviousFiles);
         RestoreFiles restored = RestoreFiles.empty();
-        if (!ignorePreviousFiles) {
+        if (!actualIgnorePreviousFiles) {
             restored = scanExistingFileMetas(partition, bucket);
         }
 
@@ -456,10 +482,12 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
                         partition.copy(),
                         bucket,
                         restoreFiles,
-                        getMaxSequenceNumber(restoreFiles),
+                        startingMaxSequenceNumber(
+                                getMaxSequenceNumber(restoreFiles), latestSnapshot),
                         null,
                         compactExecutor(),
-                        dvMaintainer);
+                        dvMaintainer,
+                        actualIgnorePreviousFiles);
         notifyNewWriter(writer);
 
         Snapshot previousSnapshot = restored.snapshot();
@@ -473,6 +501,36 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
 
     private long writerNumber() {
         return writers.values().stream().mapToLong(Map::size).sum();
+    }
+
+    protected boolean ignorePreviousFilesForWriter(
+            BinaryRow partition,
+            int bucket,
+            @Nullable Snapshot latestSnapshot,
+            boolean ignorePreviousFiles) {
+        return ignorePreviousFiles;
+    }
+
+    @VisibleForTesting
+    long startingMaxSequenceNumber(long restoredMaxSeqNumber, @Nullable Snapshot latestSnapshot) {
+        if (options.writeSequenceNumberInitMode() != CoreOptions.SequenceNumberInitMode.SNAPSHOT) {
+            return restoredMaxSeqNumber;
+        }
+
+        OptionalLong snapshotMaxSeqNumber =
+                SequenceSnapshotProperties.maxSequenceNumber(latestSnapshot);
+        long startingMaxSeqNumber =
+                Math.max(restoredMaxSeqNumber, snapshotMaxSeqNumber.orElse(-1L));
+        LOG.info(
+                "Start writer sequence number for table {} from restored max sequence number {}, "
+                        + "snapshot max sequence number {}, selected max sequence number {}, "
+                        + "snapshot id {}.",
+                tableName,
+                restoredMaxSeqNumber,
+                snapshotMaxSeqNumber.isPresent() ? snapshotMaxSeqNumber.getAsLong() : null,
+                startingMaxSeqNumber,
+                latestSnapshot == null ? null : latestSnapshot.id());
+        return startingMaxSeqNumber;
     }
 
     @Override
@@ -536,7 +594,8 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
             long restoredMaxSeqNumber,
             @Nullable CommitIncrement restoreIncrement,
             ExecutorService compactExecutor,
-            @Nullable BucketedDvMaintainer deletionVectorsMaintainer);
+            @Nullable BucketedDvMaintainer deletionVectorsMaintainer,
+            boolean ignorePreviousFiles);
 
     // force buffer spill to avoid out of memory in batch mode
     protected void forceBufferSpill() throws Exception {}
@@ -578,5 +637,59 @@ public abstract class AbstractFileStoreWrite<T> implements FileStoreWrite<T> {
     @VisibleForTesting
     public CompactionMetrics compactionMetrics() {
         return compactionMetrics;
+    }
+
+    private static class PartitionTimestampValidator {
+
+        private final PartitionTimeExtractor timeExtractor;
+        private final RowDataToObjectArrayConverter partitionConverter;
+        private final List<String> partitionKeys;
+
+        private PartitionTimestampValidator(
+                PartitionTimeExtractor timeExtractor,
+                RowDataToObjectArrayConverter partitionConverter,
+                List<String> partitionKeys) {
+            this.timeExtractor = timeExtractor;
+            this.partitionConverter = partitionConverter;
+            this.partitionKeys = partitionKeys;
+        }
+
+        @Nullable
+        private static PartitionTimestampValidator create(
+                CoreOptions options, RowType partitionType) {
+            if (!options.partitionTimestampFormatStrict()) {
+                return null;
+            }
+            String timeFormatter = options.partitionTimestampFormatter();
+            String timePattern = options.partitionTimestampPattern();
+            if ((timeFormatter != null || timePattern != null)
+                    && partitionType.getFieldCount() > 0) {
+                return new PartitionTimestampValidator(
+                        new PartitionTimeExtractor(timePattern, timeFormatter),
+                        new RowDataToObjectArrayConverter(partitionType),
+                        partitionType.getFieldNames());
+            }
+            return null;
+        }
+
+        private void validate(BinaryRow partition) {
+            Object[] array = partitionConverter.convert(partition);
+            try {
+                timeExtractor.extract(partitionKeys, Arrays.asList(array));
+            } catch (DateTimeParseException e) {
+                String partitionInfo =
+                        IntStream.range(0, partitionKeys.size())
+                                .mapToObj(i -> partitionKeys.get(i) + "=" + array[i])
+                                .collect(Collectors.joining(", "));
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Partition %s does not match the 'partition.timestamp-formatter' or "
+                                        + "'partition.timestamp-pattern' configuration. "
+                                        + "This might be caused by an incorrectly specified partition field. "
+                                        + "Please check your partition configuration.",
+                                partitionInfo),
+                        e);
+            }
+        }
     }
 }

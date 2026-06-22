@@ -67,11 +67,17 @@ public interface FileEntry {
 
     List<String> extraFiles();
 
+    long rowCount();
+
+    @Nullable
+    Long firstRowId();
+
     /**
      * The same {@link Identifier} indicates that the {@link ManifestEntry} refers to the same data
      * file.
      */
     class Identifier {
+
         public final BinaryRow partition;
         public final int bucket;
         public final int level;
@@ -234,7 +240,12 @@ public interface FileEntry {
         return readDeletedEntries(
                 m ->
                         manifestFile.read(
-                                m.fileName(), m.fileSize(), deletedFilter(), Filter.alwaysTrue()),
+                                m.fileName(),
+                                m.fileSize(),
+                                Filter.alwaysTrue(),
+                                deletedFilter(),
+                                Filter.alwaysTrue(),
+                                SimpleFileEntry::from),
                 manifestFiles,
                 manifestReadParallelism);
     }

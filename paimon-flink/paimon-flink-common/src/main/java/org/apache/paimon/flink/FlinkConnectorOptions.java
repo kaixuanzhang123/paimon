@@ -72,6 +72,18 @@ public class FlinkConnectorOptions {
                                     + "By default, if this option is not defined, the planner will derive the parallelism "
                                     + "for each statement individually by also considering the global configuration.");
 
+    public static final ConfigOption<Boolean> UNAWARE_BUCKET_NO_SHUFFLE =
+            ConfigOptions.key("unaware-bucket.no-shuffle")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the CDC sync pipeline will skip the network shuffle between "
+                                    + "source and writer operators. This is only supported for "
+                                    + "bucket-unaware (append) tables where each writer subtask "
+                                    + "independently appends data without bucket ownership constraints. "
+                                    + "This eliminates data transfer overhead when the source already "
+                                    + "provides suitable data distribution (e.g., Kafka partitions).");
+
     public static final ConfigOption<Boolean> INFER_SCAN_PARALLELISM =
             ConfigOptions.key("scan.infer-parallelism")
                     .booleanType()
@@ -276,6 +288,18 @@ public class FlinkConnectorOptions {
                     .defaultValue(false)
                     .withDescription("Whether to refresh lookup table in an async thread.");
 
+    public static final ConfigOption<Boolean> LOOKUP_DYNAMIC_PARTITION_REFRESH_ASYNC =
+            ConfigOptions.key("lookup.dynamic-partition.refresh.async")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to refresh dynamic partition lookup table asynchronously. "
+                                    + "This option only works for full cache dimension table. "
+                                    + "When enabled, partition changes will be loaded in a background thread "
+                                    + "while the old partition data continues serving queries. "
+                                    + "When disabled (default), partition refresh is synchronous and blocks queries "
+                                    + "until the new partition data is fully loaded.");
+
     public static final ConfigOption<Integer> LOOKUP_REFRESH_ASYNC_PENDING_SNAPSHOT_COUNT =
             ConfigOptions.key("lookup.refresh.async.pending-snapshot-count")
                     .intType()
@@ -447,13 +471,6 @@ public class FlinkConnectorOptions {
                             "Bounded mode for Paimon consumer. "
                                     + "By default, Paimon automatically selects bounded mode based on the mode of the Flink job.");
 
-    public static final ConfigOption<Integer> POSTPONE_DEFAULT_BUCKET_NUM =
-            key("postpone.default-bucket-num")
-                    .intType()
-                    .defaultValue(1)
-                    .withDescription(
-                            "Bucket number for the partitions compacted for the first time in postpone bucket tables.");
-
     public static final ConfigOption<Boolean> SCAN_DEDICATED_SPLIT_GENERATION =
             key("scan.dedicated-split-generation")
                     .booleanType()
@@ -483,12 +500,50 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Controls the cache memory of writer coordinator to cache manifest files in Job Manager.");
 
+    public static final ConfigOption<Duration> SINK_WRITER_COORDINATOR_CACHE_EXPIRE_AFTER_ACCESS =
+            key("sink.writer-coordinator.cache-expire-after-access")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional idle TTL for writer coordinator manifest cache entries. "
+                                    + "Disabled by default. When set, an entry that has not been "
+                                    + "accessed within this duration is evicted, releasing its heap. "
+                                    + "The cache stays bounded by 'sink.writer-coordinator.cache-memory' "
+                                    + "regardless of this setting.");
+
+    public static final ConfigOption<Boolean> SINK_WRITER_COORDINATOR_CACHE_SOFT_VALUES =
+            key("sink.writer-coordinator.cache-soft-values")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "If true (default), writer coordinator manifest cache entries are held "
+                                    + "with soft references and may be reclaimed by the GC under "
+                                    + "memory pressure. This can trigger a cache-thrash spiral "
+                                    + "where reclaimed entries are refetched, spiking heap and "
+                                    + "forcing further reclamation. Set to false to hold entries "
+                                    + "with strong references, breaking the spiral; the cache then "
+                                    + "stays bounded by weight up to "
+                                    + "'sink.writer-coordinator.cache-memory' (size the Job Manager "
+                                    + "total heap memory to at least roughly twice that value).");
+
     public static final ConfigOption<MemorySize> SINK_WRITER_COORDINATOR_PAGE_SIZE =
             key("sink.writer-coordinator.page-size")
                     .memoryType()
                     .defaultValue(MemorySize.ofKibiBytes(32))
                     .withDescription(
                             "Controls the page size for one RPC request of writer coordinator.");
+
+    public static final ConfigOption<Boolean> SINK_WRITER_COORDINATOR_PREFETCH_MANIFESTS =
+            key("sink.writer-coordinator.prefetch-manifests")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the writer coordinator eagerly reads all data manifests of the "
+                                    + "latest snapshot during refresh to warm the in-Job-Manager manifest "
+                                    + "cache. This avoids many concurrent cold manifest reads when "
+                                    + "high-parallelism writers restore at the same time, reducing Job "
+                                    + "Manager heap pressure at the cost of one full manifest read per "
+                                    + "refresh.");
 
     public static final ConfigOption<Boolean> FILESYSTEM_JOB_LEVEL_SETTINGS_ENABLED =
             key("filesystem.job-level-settings.enabled")

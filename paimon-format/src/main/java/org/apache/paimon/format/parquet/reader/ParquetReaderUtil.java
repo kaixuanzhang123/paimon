@@ -22,6 +22,7 @@ import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.heap.CastedArrayColumnVector;
 import org.apache.paimon.data.columnar.heap.CastedMapColumnVector;
 import org.apache.paimon.data.columnar.heap.CastedRowColumnVector;
+import org.apache.paimon.data.columnar.heap.CastedVectorColumnVector;
 import org.apache.paimon.data.columnar.heap.HeapArrayVector;
 import org.apache.paimon.data.columnar.heap.HeapBooleanVector;
 import org.apache.paimon.data.columnar.heap.HeapByteVector;
@@ -51,6 +52,7 @@ import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.VariantType;
+import org.apache.paimon.types.VectorType;
 import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.StringUtils;
 
@@ -100,6 +102,7 @@ public class ParquetReaderUtil {
             case CHAR:
             case VARCHAR:
             case VARBINARY:
+            case BLOB:
                 return new HeapBytesVector(batchSize);
             case BINARY:
                 return new HeapBytesVector(batchSize);
@@ -125,6 +128,11 @@ public class ParquetReaderUtil {
                 return new HeapArrayVector(
                         batchSize,
                         createWritableColumnVector(batchSize, arrayType.getElementType()));
+            case VECTOR:
+                VectorType vectorType = (VectorType) fieldType;
+                return new HeapArrayVector(
+                        batchSize,
+                        createWritableColumnVector(batchSize, vectorType.getElementType()));
             case MAP:
                 MapType mapType = (MapType) fieldType;
                 return new HeapMapVector(
@@ -176,6 +184,9 @@ public class ParquetReaderUtil {
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
                 return new ParquetTimestampVector(writableVector);
+            case BLOB:
+                // Physical representation is bytes; higher-level Row#getBlob() handles descriptor.
+                return writableVector;
             case ARRAY:
                 return new CastedArrayColumnVector(
                         (HeapArrayVector) writableVector,
@@ -184,6 +195,16 @@ public class ParquetReaderUtil {
                                 Arrays.stream(writableVector.getChildren())
                                         .map(WritableColumnVector.class::cast)
                                         .toArray(WritableColumnVector[]::new)));
+            case VECTOR:
+                VectorType vectorType = (VectorType) type;
+                return new CastedVectorColumnVector(
+                        (HeapArrayVector) writableVector,
+                        createReadableColumnVectors(
+                                Collections.singletonList(vectorType.getElementType()),
+                                Arrays.stream(writableVector.getChildren())
+                                        .map(WritableColumnVector.class::cast)
+                                        .toArray(WritableColumnVector[]::new))[0],
+                        vectorType.getLength());
             case MAP:
                 MapType mapType = (MapType) type;
                 return new CastedMapColumnVector(
@@ -318,8 +339,11 @@ public class ParquetReaderUtil {
                     groupColumnIO.getFieldPath());
         }
 
-        if (type instanceof ArrayType) {
-            ArrayType arrayType = (ArrayType) type;
+        if (type instanceof ArrayType || type instanceof VectorType) {
+            DataType elementType =
+                    type instanceof ArrayType
+                            ? ((ArrayType) type).getElementType()
+                            : ((VectorType) type).getElementType();
             ColumnIO elementTypeColumnIO;
             if (columnIO instanceof GroupColumnIO) {
                 GroupColumnIO groupColumnIO = (GroupColumnIO) columnIO;
@@ -329,7 +353,7 @@ public class ParquetReaderUtil {
                     }
                     elementTypeColumnIO = groupColumnIO;
                 } else {
-                    if (arrayType.getElementType() instanceof RowType) {
+                    if (elementType instanceof RowType) {
                         elementTypeColumnIO = groupColumnIO;
                     } else {
                         elementTypeColumnIO = groupColumnIO.getChild(0);
@@ -343,7 +367,7 @@ public class ParquetReaderUtil {
 
             ParquetField field =
                     constructField(
-                            new DataField(0, "", arrayType.getElementType()),
+                            new DataField(0, "", elementType),
                             getArrayElementColumn(elementTypeColumnIO),
                             parquetListElementType(parquetType.asGroupType()));
             if (repetitionLevel == field.getRepetitionLevel()) {
@@ -368,7 +392,7 @@ public class ParquetReaderUtil {
     }
 
     /**
-     * Parquet's column names are case in sensitive. So when we look up columns we first check for
+     * Parquet's column names are case insensitive. So when we look up columns we first check for
      * exact match, and if that can not find we look for a case-insensitive match.
      */
     public static ColumnIO lookupColumnByName(GroupColumnIO groupColumnIO, String columnName) {
@@ -384,7 +408,10 @@ public class ParquetReaderUtil {
             }
         }
 
-        throw new RuntimeException("Can not find column io for parquet reader.");
+        throw new RuntimeException(
+                String.format(
+                        "ColumnIO for '%s' not found in Parquet schema under '%s'.",
+                        columnName, String.join(".", groupColumnIO.getFieldPath())));
     }
 
     public static GroupColumnIO getMapKeyValueColumn(GroupColumnIO groupColumnIO) {

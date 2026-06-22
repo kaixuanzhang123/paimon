@@ -144,7 +144,6 @@ public class CompactAction extends TableActionBase {
         if (fileStoreTable.coreOptions().bucket() == BucketMode.POSTPONE_BUCKET) {
             buildForPostponeBucketCompaction(env, fileStoreTable, isStreaming);
         } else if (fileStoreTable.bucketMode() == BucketMode.BUCKET_UNAWARE) {
-
             if (fileStoreTable.coreOptions().dataEvolutionEnabled()) {
                 buildForDataEvolutionTableCompact(env, fileStoreTable, isStreaming);
             } else if (fileStoreTable.coreOptions().clusteringIncrementalEnabled()) {
@@ -268,7 +267,7 @@ public class CompactAction extends TableActionBase {
             predicate =
                     predicate
                             .visit(
-                                    new PredicateProjectionConverter(
+                                    PredicateProjectionConverter.fromProjection(
                                             table.rowType().projectIndexes(table.partitionKeys())))
                             .orElseThrow(
                                     () ->
@@ -291,7 +290,7 @@ public class CompactAction extends TableActionBase {
                 "Postpone bucket compaction currently does not support predicates");
 
         Options options = new Options(table.options());
-        int defaultBucketNum = options.get(FlinkConnectorOptions.POSTPONE_DEFAULT_BUCKET_NUM);
+        int defaultBucketNum = options.get(CoreOptions.POSTPONE_DEFAULT_BUCKET_NUM);
 
         // change bucket to a positive value, so we can scan files from the bucket = -2 directory
         Map<String, String> bucketOptions = new HashMap<>(table.options());
@@ -347,13 +346,11 @@ public class CompactAction extends TableActionBase {
                             partitionSpec,
                             options.get(FlinkConnectorOptions.SCAN_PARALLELISM));
 
-            boolean blobAsDescriptor = table.coreOptions().blobAsDescriptor();
             DataStream<InternalRow> partitioned =
                     FlinkStreamPartitioner.partition(
                             FlinkSinkBuilder.mapToInternalRow(
                                     sourcePair.getLeft(),
                                     realTable.rowType(),
-                                    blobAsDescriptor,
                                     table.catalogEnvironment().catalogContext()),
                             new RowDataChannelComputer(realTable.schema()),
                             null);

@@ -30,6 +30,7 @@ import org.apache.paimon.format.FormatReaderContext;
 import org.apache.paimon.format.OrcFormatReaderContext;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.partition.PartitionUtils;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.FileRecordReader;
@@ -42,6 +43,7 @@ import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.AsyncRecordReader;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.FormatReaderMapping;
+import org.apache.paimon.utils.Preconditions;
 
 import javax.annotation.Nullable;
 
@@ -66,7 +68,9 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
     private final FormatReaderMapping.Builder formatReaderMappingBuilder;
     private final DataFilePathFactory pathFactory;
     private final long asyncThreshold;
-
+    private final boolean ignoreCorruptFiles;
+    private final boolean ignoreLostFiles;
+    private final boolean snapshotSequenceOrdering;
     private final Map<FormatKey, FormatReaderMapping> formatReaderMappings;
     private final BinaryRow partition;
     private final DeletionVector.Factory dvFactory;
@@ -79,9 +83,9 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
             RowType valueType,
             FormatReaderMapping.Builder formatReaderMappingBuilder,
             DataFilePathFactory pathFactory,
-            long asyncThreshold,
             BinaryRow partition,
-            DeletionVector.Factory dvFactory) {
+            DeletionVector.Factory dvFactory,
+            CoreOptions coreOptions) {
         this.fileIO = fileIO;
         this.schemaManager = schemaManager;
         this.schema = schema;
@@ -89,7 +93,10 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
         this.valueType = valueType;
         this.formatReaderMappingBuilder = formatReaderMappingBuilder;
         this.pathFactory = pathFactory;
-        this.asyncThreshold = asyncThreshold;
+        this.asyncThreshold = coreOptions.fileReaderAsyncThreshold().getBytes();
+        this.ignoreCorruptFiles = coreOptions.scanIgnoreCorruptFile();
+        this.ignoreLostFiles = coreOptions.scanIgnoreLostFile();
+        this.snapshotSequenceOrdering = coreOptions.snapshotSequenceOrdering();
         this.partition = partition;
         this.formatReaderMappings = new HashMap<>();
         this.dvFactory = dvFactory;
@@ -148,6 +155,8 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
                                 ? new FormatReaderContext(fileIO, filePath, fileSize)
                                 : new OrcFormatReaderContext(
                                         fileIO, filePath, fileSize, orcPoolSize),
+                        ignoreCorruptFiles,
+                        ignoreLostFiles,
                         formatReaderMapping.getIndexMapping(),
                         formatReaderMapping.getCastMapping(),
                         PartitionUtils.create(
@@ -163,7 +172,26 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
                     new ApplyDeletionVectorReader(fileRecordReader, deletionVector.get());
         }
 
-        return new KeyValueDataFileRecordReader(fileRecordReader, keyType, valueType, file.level());
+        // In snapshot-ordering mode, APPEND files carry the commit snapshot id in
+        // minSequenceNumber (stamped at commit time); override per-record sequence with it so
+        // later snapshots win during merge. COMPACT files already carry the snapshot id in their
+        // per-record _SEQUENCE_NUMBER and are left untouched.
+        boolean overrideSequenceWithSnapshotId = false;
+        if (snapshotSequenceOrdering) {
+            Preconditions.checkState(
+                    file.fileSource().isPresent(),
+                    "sequence.snapshot-ordering requires data files with fileSource metadata. "
+                            + "This option is only safe for newly-created tables or empty tables. "
+                            + "Legacy files without fileSource cannot be ordered by commit snapshot id.");
+            overrideSequenceWithSnapshotId = file.fileSource().get() == FileSource.APPEND;
+        }
+        return new KeyValueDataFileRecordReader(
+                fileRecordReader,
+                keyType,
+                valueType,
+                file.level(),
+                overrideSequenceWithSnapshotId,
+                file.minSequenceNumber());
     }
 
     public static Builder builder(
@@ -241,6 +269,19 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
                     options);
         }
 
+        public Builder copyWithoutValue() {
+            return new Builder(
+                    fileIO,
+                    schemaManager,
+                    schema,
+                    keyType,
+                    RowType.of(),
+                    formatDiscover,
+                    pathFactory,
+                    extractor,
+                    options);
+        }
+
         public Builder withReadKeyType(RowType readKeyType) {
             this.readKeyType = readKeyType;
             return this;
@@ -279,9 +320,9 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
                     readValueType,
                     builder,
                     pathFactory.createDataFilePathFactory(partition, bucket),
-                    options.fileReaderAsyncThreshold().getBytes(),
                     partition,
-                    dvFactory);
+                    dvFactory,
+                    options);
         }
 
         protected FormatReaderMapping.Builder formatReaderMappingBuilder(
@@ -302,6 +343,10 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
 
         public FileIO fileIO() {
             return fileIO;
+        }
+
+        public CoreOptions options() {
+            return options;
         }
     }
 }

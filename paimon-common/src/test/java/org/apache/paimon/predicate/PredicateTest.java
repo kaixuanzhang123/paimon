@@ -23,6 +23,8 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.format.SimpleColStats;
 import org.apache.paimon.types.CharType;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.DoubleType;
+import org.apache.paimon.types.FloatType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.VarCharType;
@@ -60,6 +62,26 @@ public class PredicateTest {
                 .isEqualTo(false);
 
         assertThat(predicate.negate().orElse(null)).isEqualTo(builder.notEqual(0, 5));
+    }
+
+    @Test
+    public void testBinaryUnsignedComparison() {
+        PredicateBuilder builder = new PredicateBuilder(RowType.of(DataTypes.BYTES()));
+
+        Predicate greaterThan = builder.greaterThan(0, new byte[] {(byte) 0x7F});
+        assertThat(greaterThan.test(GenericRow.of((Object) new byte[] {(byte) 0x80}))).isTrue();
+        assertThat(greaterThan.test(GenericRow.of((Object) new byte[] {(byte) 0x7E}))).isFalse();
+
+        Predicate greaterThanLow = builder.greaterThan(0, new byte[] {(byte) 0x01});
+        assertThat(greaterThanLow.test(GenericRow.of((Object) new byte[] {(byte) 0xFF}))).isTrue();
+
+        Predicate lessThan = builder.lessThan(0, new byte[] {(byte) 0x80});
+        assertThat(lessThan.test(GenericRow.of((Object) new byte[] {(byte) 0x01}))).isTrue();
+        assertThat(lessThan.test(GenericRow.of((Object) new byte[] {(byte) 0xFF}))).isFalse();
+
+        Predicate between = builder.between(0, new byte[] {(byte) 0x70}, new byte[] {(byte) 0x90});
+        assertThat(between.test(GenericRow.of((Object) new byte[] {(byte) 0x80}))).isTrue();
+        assertThat(between.test(GenericRow.of((Object) new byte[] {(byte) 0x60}))).isFalse();
     }
 
     @Test
@@ -293,6 +315,32 @@ public class PredicateTest {
                 .isEqualTo(false);
 
         assertThat(predicate.negate().orElse(null)).isEqualTo(builder.isNull(0));
+    }
+
+    @Test
+    public void testIsNaNDouble() {
+        PredicateBuilder builder = new PredicateBuilder(RowType.of(new DoubleType()));
+        Predicate predicate = builder.isNaN(0);
+
+        assertThat(predicate.test(GenericRow.of(Double.NaN))).isEqualTo(true);
+        assertThat(predicate.test(GenericRow.of(1.5))).isEqualTo(false);
+        assertThat(predicate.test(GenericRow.of(Double.POSITIVE_INFINITY))).isEqualTo(false);
+        assertThat(predicate.test(GenericRow.of((Object) null))).isEqualTo(false);
+
+        assertThat(test(predicate, 3, new SimpleColStats[] {new SimpleColStats(0.0, 1.0, 0L)}))
+                .isEqualTo(true);
+
+        assertThat(predicate.negate()).isEmpty();
+    }
+
+    @Test
+    public void testIsNaNFloat() {
+        PredicateBuilder builder = new PredicateBuilder(RowType.of(new FloatType()));
+        Predicate predicate = builder.isNaN(0);
+
+        assertThat(predicate.test(GenericRow.of(Float.NaN))).isEqualTo(true);
+        assertThat(predicate.test(GenericRow.of(1.5f))).isEqualTo(false);
+        assertThat(predicate.test(GenericRow.of((Object) null))).isEqualTo(false);
     }
 
     @Test

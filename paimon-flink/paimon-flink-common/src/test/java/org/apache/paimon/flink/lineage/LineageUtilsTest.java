@@ -1,0 +1,264 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.lineage;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.flink.PaimonDataStreamScanProvider;
+import org.apache.paimon.flink.PaimonDataStreamSinkProvider;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.options.CatalogOptions;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.types.IntType;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VarCharType;
+
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.streaming.api.lineage.DatasetConfigFacet;
+import org.apache.flink.streaming.api.lineage.LineageDataset;
+import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
+import org.apache.flink.streaming.api.lineage.LineageVertex;
+import org.apache.flink.streaming.api.lineage.LineageVertexProvider;
+import org.apache.flink.streaming.api.lineage.SourceLineageVertex;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Tests for {@link LineageUtils}. */
+class LineageUtilsTest {
+
+    @TempDir java.nio.file.Path temp;
+
+    private Path warehouse;
+    private Path tablePath;
+
+    @BeforeEach
+    void setUp() {
+        // mirror real Paimon layout: <warehouse>/<database>.db/<table>
+        warehouse = new Path(temp.toUri().toString());
+        tablePath = new Path(warehouse, "test_db.db/test_table");
+    }
+
+    private FileStoreTable createTable(
+            Map<String, String> options,
+            java.util.List<String> partitionKeys,
+            java.util.List<String> primaryKeys)
+            throws Exception {
+        new SchemaManager(LocalFileIO.create(), tablePath)
+                .createTable(
+                        new Schema(
+                                RowType.of(new IntType(), new VarCharType(100), new IntType())
+                                        .getFields(),
+                                partitionKeys,
+                                primaryKeys,
+                                options,
+                                ""));
+        return FileStoreTableFactory.create(LocalFileIO.create(), tablePath);
+    }
+
+    @Test
+    void testGetNamespaceWithNullCatalogContext() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+        assertThat(LineageUtils.getNamespace(table, null)).isEqualTo(table.options().get("path"));
+    }
+
+    @Test
+    void testGetNamespaceWithCatalogContext() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+        Options options = new Options();
+        options.set(CatalogOptions.WAREHOUSE, warehouse.toString());
+        CatalogContext ctx = CatalogContext.create(options);
+
+        assertThat(LineageUtils.getNamespace(table, ctx)).isEqualTo(warehouse.toString());
+    }
+
+    @Test
+    void testGetNamespaceWithCatalogContextNoWarehouse() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+        CatalogContext ctx = CatalogContext.create(new Options());
+        assertThat(LineageUtils.getNamespace(table, ctx)).isEqualTo(table.options().get("path"));
+    }
+
+    @Test
+    void testSourceLineageVertexBounded() throws Exception {
+        Options catalogOptions = new Options();
+        catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse.toString());
+        Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(catalogOptions));
+        catalog.createDatabase("test_db", true);
+        catalog.createTable(
+                org.apache.paimon.catalog.Identifier.create("test_db", "src"),
+                new Schema(
+                        RowType.of(new IntType(), new VarCharType(100), new IntType()).getFields(),
+                        Collections.emptyList(),
+                        Arrays.asList("f0"),
+                        new HashMap<>(),
+                        ""),
+                false);
+        FileStoreTable table =
+                (FileStoreTable)
+                        catalog.getTable(
+                                org.apache.paimon.catalog.Identifier.create("test_db", "src"));
+
+        SourceLineageVertex vertex = LineageUtils.sourceLineageVertex("paimon.db.src", true, table);
+
+        assertThat(vertex).isInstanceOf(PaimonSourceLineageVertex.class);
+        assertThat(vertex.boundedness()).isEqualTo(Boundedness.BOUNDED);
+        assertThat(vertex.datasets()).hasSize(1);
+
+        LineageDataset dataset = vertex.datasets().get(0);
+        assertThat(dataset.name()).isEqualTo("paimon.db.src");
+        assertThat(dataset.namespace()).isEqualTo(warehouse.toString());
+        catalog.close();
+    }
+
+    @Test
+    void testSourceLineageVertexUnbounded() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+
+        SourceLineageVertex vertex =
+                LineageUtils.sourceLineageVertex("paimon.db.src", false, table);
+
+        assertThat(vertex.boundedness()).isEqualTo(Boundedness.CONTINUOUS_UNBOUNDED);
+    }
+
+    @Test
+    void testSinkLineageVertex() throws Exception {
+        Options catalogOptions = new Options();
+        catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse.toString());
+        Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(catalogOptions));
+        catalog.createDatabase("test_db", true);
+        catalog.createTable(
+                org.apache.paimon.catalog.Identifier.create("test_db", "sink"),
+                new Schema(
+                        RowType.of(new IntType(), new VarCharType(100), new IntType()).getFields(),
+                        Collections.emptyList(),
+                        Arrays.asList("f0"),
+                        new HashMap<>(),
+                        ""),
+                false);
+        FileStoreTable table =
+                (FileStoreTable)
+                        catalog.getTable(
+                                org.apache.paimon.catalog.Identifier.create("test_db", "sink"));
+
+        LineageVertex vertex = LineageUtils.sinkLineageVertex("paimon.db.sink", table);
+
+        assertThat(vertex).isInstanceOf(PaimonSinkLineageVertex.class);
+        assertThat(vertex.datasets()).hasSize(1);
+
+        LineageDataset dataset = vertex.datasets().get(0);
+        assertThat(dataset.name()).isEqualTo("paimon.db.sink");
+        assertThat(dataset.namespace()).isEqualTo(warehouse.toString());
+        catalog.close();
+    }
+
+    @Test
+    void testConfigFacetContainsPartitionAndPrimaryKeys() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Arrays.asList("f2"), Arrays.asList("f0", "f2"));
+
+        LineageVertex vertex = LineageUtils.sinkLineageVertex("paimon.db.t", table);
+        LineageDataset dataset = vertex.datasets().get(0);
+
+        Map<String, LineageDatasetFacet> facets = dataset.facets();
+        assertThat(facets).containsKey("config");
+
+        DatasetConfigFacet configFacet = (DatasetConfigFacet) facets.get("config");
+        Map<String, String> config = configFacet.config();
+        assertThat(config).containsEntry("type", "paimon");
+        assertThat(config).containsEntry("partition-keys", "f2");
+        assertThat(config).containsEntry("primary-keys", "f0,f2");
+    }
+
+    @Test
+    void testConfigFacetIncludesPaimonOptions() throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.CHANGELOG_PRODUCER.key(), "lookup");
+
+        FileStoreTable table = createTable(options, Collections.emptyList(), Arrays.asList("f0"));
+
+        SourceLineageVertex vertex = LineageUtils.sourceLineageVertex("paimon.db.t", true, table);
+        LineageDataset dataset = vertex.datasets().get(0);
+
+        DatasetConfigFacet configFacet = (DatasetConfigFacet) dataset.facets().get("config");
+        Map<String, String> config = configFacet.config();
+        assertThat(config).containsEntry(CoreOptions.CHANGELOG_PRODUCER.key(), "lookup");
+    }
+
+    @Test
+    void testConfigFacetWithEmptyKeys() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Collections.emptyList());
+
+        LineageVertex vertex = LineageUtils.sinkLineageVertex("paimon.db.t", table);
+        LineageDataset dataset = vertex.datasets().get(0);
+
+        DatasetConfigFacet configFacet = (DatasetConfigFacet) dataset.facets().get("config");
+        Map<String, String> config = configFacet.config();
+        assertThat(config).containsEntry("partition-keys", "");
+        assertThat(config).containsEntry("primary-keys", "");
+    }
+
+    @Test
+    void testScanProviderImplementsLineageVertexProvider() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+
+        PaimonDataStreamScanProvider provider =
+                new PaimonDataStreamScanProvider(true, env -> null, "paimon.db.src", table);
+
+        assertThat(provider).isInstanceOf(LineageVertexProvider.class);
+        LineageVertex vertex = provider.getLineageVertex();
+        assertThat(vertex).isInstanceOf(SourceLineageVertex.class);
+        assertThat(vertex.datasets()).hasSize(1);
+        assertThat(vertex.datasets().get(0).name()).isEqualTo("paimon.db.src");
+    }
+
+    @Test
+    void testSinkProviderImplementsLineageVertexProvider() throws Exception {
+        FileStoreTable table =
+                createTable(new HashMap<>(), Collections.emptyList(), Arrays.asList("f0"));
+
+        PaimonDataStreamSinkProvider provider =
+                new PaimonDataStreamSinkProvider(dataStream -> null, "paimon.db.sink", table);
+
+        assertThat(provider).isInstanceOf(LineageVertexProvider.class);
+        LineageVertex vertex = provider.getLineageVertex();
+        assertThat(vertex.datasets()).hasSize(1);
+        assertThat(vertex.datasets().get(0).name()).isEqualTo("paimon.db.sink");
+    }
+}
